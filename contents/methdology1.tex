@@ -1,0 +1,323 @@
+\chapter{注意力和激活值感知的低秩KV缓存特征压缩方法}
+\label{chap:scaling_svd}
+为摆脱传统固定分解在跨任务场景下脆弱的泛化性和性能损失，本章提出一种同时建模激活值与注意力分布的基于SVD的低秩特征压缩算法。传统 SVD 分解往往直接以参数矩阵 $W_k$、$W_v$ 的低秩近似为优化目标，忽略了推理阶段真实被使用的是 $XW_k$、$AXW_v$ 等乘积：注意力分数 $A$ 和层内激活 $X$ 会与 $W_k$、$W_v$ 相乘，其结果才决定 KV 缓存的能量分布与误差放大。本章针对这一实际目标重新推导，显式在SVD的优化目标中引入激活/注意力，使保留下来的奇异向量最大程度对齐模型推理时的效果；我们的算法在保留 SVD 降维可解释性的同时，更贴合推理过程中的真实运算。
+
+
+\section{背景知识与问题描述}
+为了后续方法推导能够更清晰地衔接，本节首先回顾我们将在后续章节频繁使用的低秩分解基本原理，并梳理大模型常见的Grouped-Query Attention(GQA)架构。SVD提供了对参数矩阵进行最优低秩近似的基础手段，而GQA已经成为主流大模型在长上下文推理中控制KV缓存成本的关键结构，因此我们在设计压缩方案时必须同时考虑到常规的MHA和GQA。
+
+\subsection{奇异值分解}
+
+奇异值分解（Singular Value Decomposition, SVD）是描述任意实矩阵能量分布的标准工具。对尺寸为 $m\times n$ 的矩阵 $A$，SVD（图\ref{SVD}）给出
+\[
+A = U\Sigma V^\top,
+\]
+其中 $U\in\mathbb{R}^{m\times \min(m,n)}$、$V\in\mathbb{R}^{n \times \min(m,n)}$ 为正交矩阵，$\Sigma=\mathrm{diag}(\sigma_1,\sigma_2,\ldots,\sigma_{\min(m,n)})$ 为按降序排列的非负奇异值。$\sigma_i^2$ 表示 $A$ 在对应奇异向量方向上的能量，满足 $\|A\|_F^2 = \sum_i \sigma_i^2$。
+
+在计算低秩逼近时，可将 $A$ 的前 $r$ 个奇异值和奇异向量截断，得到秩-$r$ 矩阵
+\[
+A_r = U_r \Sigma_r V_r^\top,
+\]
+其中 $U_r$、$V_r$ 分别为保留前 $r$ 列的列正交矩阵，$\Sigma_r$ 为前 $r$ 个奇异值构成的对角阵。按照 Eckart–Young–Mirsky 定理，$A_r$ 是在 Frobenius 范数与谱范数下对 $A$ 最优的秩-$r$ 近似。这一性质为 KV 特征降维提供了明确的误差界：截断掉的能量 $\sum_{i>r} \sigma_i^2$ 即为重建误差的上界。
+
+实际求解 SVD 时常用两类方法：（1）直接的全量分解，适用于维度相对较小或离线处理；（2）增量式/随机化 SVD，如 randomized SVD、power iteration，可在大规模矩阵上以较低时间/存储开销求得近似奇异子空间。在本章后续算法中，我们以增量式 SVD 为基础，结合注意力与激活加权重新定义目标函数，使所保留的奇异向量更准确地对齐推理阶段真正参与运算的$XW_k$、$AXW_v$产物。
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+      matA/.style={minimum width=2.2cm, minimum height=3cm, draw, line width=1pt},
+      matU/.style={minimum width=2.2cm, minimum height=3cm, draw, line width=1pt},
+      matSquare/.style={minimum width=2.2cm, minimum height=2.2cm, draw, line width=1pt},
+      >=Latex, font=\small
+    ]
+
+    % A
+    \node[matA,fill=blue!15] (A) at (0,0) {$A_{m\times n}$};
+    \draw[decorate,decoration={brace,amplitude=4pt},line width=0.8pt]
+      (-1.1,1.7) -- (1.1,1.7) node[midway,above=3pt] {$n$};
+    \draw[decorate,decoration={brace,amplitude=4pt},line width=0.8pt]
+      (-1.4,-1.5) -- (-1.4,1.5) node[midway,left=3pt] {$m$};
+
+    % equal sign
+    \node at (1.5,0) {$=$};
+
+    % U
+    \node[matU,fill=green!15] (U) at (3.0,0) {$U_{m\times n}$};
+
+    % multiply sign
+    \node at (4.4,0) {$\times$};
+
+    % Sigma
+    \node[matSquare,fill=yellow!20] (S) at (5.8,0) {$\Sigma_{n\times n}$};
+
+    % multiply sign
+    \node at (7.2,0) {$\times$};
+
+    % V^T
+    \node[matSquare,fill=orange!20] (V) at (8.6,0) {$V_{n\times n}^{\top}$};
+
+    % labels
+    \node[below=4pt] at (3.0,-1.7) {左奇异向量};
+    \node[below=4pt] at (5.8,-1.7) {奇异值};
+    \node[below=4pt] at (8.6,-1.7) {右奇异向量$^{\top}$};
+
+  \end{tikzpicture}
+  \caption{矩阵 $A$ 的奇异值分解示意：$A = U\Sigma V^\top$（$m>n$）。}
+  \label{SVD}
+\end{figure}
+\subsection{GQA（Grouped-Query Attention）}
+主流开源大模型在长上下文推理场景中广泛采用Grouped-Query Attention(GQA)以降低推理端的KV缓存占用。与标准多头注意力(MHA)为每个Query头都分配独立的Key/Value投影不同，GQA将$H$个Query头划分为$G$个分组，每个分组共享桶一套$W_{k,g}$与$W_{v,g}$。该结构在推理阶段只需要维护$G$份KV缓存，显著减少了显存消耗，并能够在相同硬件条件下支撑更长的序列或更大的批量。图\ref{fig:enter-label}展示了GQA中Query，Key和Value的对应关系。
+
+
+GQA把多个Query头的上下文需求折叠到同一份$K_g/V_g$中，因此，我们在问题建模阶段显式引入$g$和$h$两个层级的索引，同时刻画“分组”和“头内”两个维度：$g$捕捉不同分组共享同一套KV投影的约束，$h$刻画被同一分组复用的多个Query头的注意力反馈。只有让低秩压缩同时考虑到$\{g,h\}$两个轴，我们才能在后续推导中准确分析误差如何在GQA结构中传播，并设计兼容主流大模型的KV压缩方案。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.6\linewidth]{figures/GQA.png}
+    \caption{GQA架构}
+    \label{fig:enter-label}
+\end{figure}
+
+\subsection{基于低秩分解的KV缓存特征维压缩}
+\label{sec:low rank approximate}
+图\ref{fig:lowrank}展示了使用SVD存储中间值来压缩KV缓存的示意。原始的Key/Value变换矩阵$W_k$、$W_v$先通过SVD分解成$P$和$Q$两个较小的矩阵$W\approx PQ$，其中$P=U\sqrt{\Sigma}$，$Q=\sqrt{\Sigma}V^T$。推理时不再直接生成并缓存完整的$K=XW_k$、$V=XW_v$，而是先计算中间值$K'=XP_k$,$V'=XP_v$并写入缓存，随后在需要重建完整KV向量时再右乘$Q$。这一设计允许我们以$\mathcal{O}(l\times r)$的存储成本代替原本$\mathcal{O}(l \times d)$的KV缓存，其中$r\ll d$是保留的秩，$l$是KV缓存中保留的词元数。由于SVD提供了给定秩约束下最优的F范数近似，主能量集中在前几个奇异值的KV矩阵可以在较小秩下保持高保真度。
+
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/low_rank.pdf}
+    \caption{SVD降维压缩KV}
+    \label{fig:lowrank}
+\end{figure}
+
+直接对$W_k$、$W_v$进行SVD分解，并根据分配给该层的KV参数矩阵的预算来保留一部分秩，是Eckart–Young–Mirsky定理下对$W_k$、$W_v$的最优低秩近似。但对参数矩阵的最优近似并不一定能最多得保留完整模型的效果。这是因为SVD的优化目标是寻找到低秩矩阵$P$、$Q$相乘使结果与原参数矩阵的误差最小:
+\[
+\min_{\{P_{k/v,h},Q_{k/v,h}\}}\sum_{h=1}^\mathcal{H}\bigl\|W_{k/v,h}-P_{k/v,h}Q_{k/v,h}\bigr\|_F^2,
+\]
+其中$\mathcal{H}$表示MHA中的注意力头数。如果考虑GQA，则优化目标应该改写为:
+\[
+\min_{\{P_{k/v,g},Q_{k/v,g}\}}\sum_{g=1}^G\bigl\|W_{k/v,g}-P_{k/v,g}Q_{k/v,g}\bigr\|_F^2,
+\]
+$G$表示模型每一层GQA中的Key/Value的组数。后续我们的推导都将在GQA的架构下进行，因为MHA相当于$\mathcal{H}=G$的特殊情况下的GQA。
+而在模型推理过程中，注意力层在计算Key矩阵的时候$W_k$需要与激活值$X$相乘，因此对于Key矩阵压缩前后我们想要最小化的目标实际应该为：
+\[
+\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G\bigl\|XW_{k,g}-XP_{k,g}Q_{k,g}\bigr\|_F^2,
+\]
+显而易见，其最优解的$P$、$Q$将不再是由$W_k$、$W_v$的SVD得到。对于Value缓存的低秩近似，则会更复杂一些。模型注意力层中第$h$个头的注意力层计算的结果为：
+\[
+ \operatorname{Attention}(Q_h,K_{\left\lfloor \frac{h}{G} \right\rfloor},V_{\left\lfloor \frac{h}{G} \right\rfloor}) = \operatorname{softmax}\left(\frac{Q_hK_{\left\lfloor \frac{h}{G} \right\rfloor}^\top}{\sqrt{d_k}}\right)V_{\left\lfloor \frac{h}{G} \right\rfloor}=A_{h}XW_{v,\left\lfloor \frac{h}{G} \right\rfloor}.
+\]
+其中$\left\lfloor \frac{h}{G} \right\rfloor$表示Query第$h$个注意力头除以总的KV组数后向下取整，为对应该Query的KV组索引数。$d_k$表示Query和Key的特征维度，用来维持计算结果的数值稳定。
+
+从注意力层的计算可以发现，$W_v$不仅会与激活值$X$相乘，还要进一步和注意力分数矩阵$A$做计算。考虑到后续推导都使用GQA，所有出现的小写索引$h$都专门用于标识某个GQA分组内部被复用的Query头编号（例如$h=1,\dots,H$），不再表示传统MHA中的“全局第$h$个head”，以避免符号歧义。因此对于Value矩阵压缩前后需要最小化的实际目标应该为：
+\[
+\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\bigl\|A_{g,h}XW_{v,g}-A_{g,h}XP_{v,g}Q_{v,g}\bigr\|_F^2,
+\]
+至此，我们已经给出了最朴素的低秩优化目标形式。接下来的“激活感知的Key投影低秩分解”与“注意力-激活感知的Value投影低秩分解”两节，将在这一基础上进一步讨论如何构造并求解得到更贴近实际推理过程的$P/Q$矩阵。
+
+
+\section{激活与注意力感知的低秩求解}
+\subsection{激活感知的Key投影低秩分解}
+\label{sec:key_decomposition}
+为了通过低秩分解并存储中间值的范式对Key缓存进行压缩，我们需要对原本分解的目标$W_k$进行一些变换，再进行分解才能够得到在\ref{sec:low rank approximate}中优化问题的最优解。我们将对$W_k$做乘法变换的矩阵记为$S_K$，对$S_kW_k$进行低秩分解，则优化问题可以写为：
+\[
+\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G\bigl\|XS_k^{-1}S_kW_{k,g}-XS_k^{-1}P_{k,g}Q_{k,g}\bigr\|_F^2,
+\]
+在这里我们引入一个引理：
+\begin{lemma}\label{lem:Ftotrace}
+    矩阵$M$的Frobenius范数的平方等于其转置与其自身相乘结果的迹
+  \[\bigl\|M\bigl\|_F^2 = \operatorname{tr}(M^\top M)\]
+\end{lemma}
+
+因此上述式子可以进一步推导：
+\begin{align}
+  & \min_{\{P_{k,g},Q_{k,g}\}}
+  \sum_{g=1}^G \Bigl\| X S_k^{-1} S_k W_{k,g} - X S_k^{-1} P_{k,g} Q_{k,g} \Bigr\|_F^2 \\
+  = &\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \Bigl\| X \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr) \Bigr\|_F^2 \\
+  = &\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \operatorname{tr}\Bigl[
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)^\top
+       X^\top X
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)
+     \Bigr]. \label{eq:1}
+\end{align}
+后续推导需要使用cholesky矩阵分解，这里先对其进行介绍：对于任意对称正定矩阵$M\in\mathbb{R}^{d\times d}$，存在唯一的下三角矩阵$L$（对角元素为正）满足
+\begin{equation}
+  M = LL^\top.
+\end{equation}
+和SVD-LLM\cite{}以及Palu\cite{}中的推导思路一致，我们将cholesky分解用到\ref{eq:1}的$X^{\top}X$上，另$X^{\top}X=LL^\top$，并另$S_k=L^\top$，则原式可以推导为：
+\begin{align}
+  &\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \operatorname{tr}\Bigl[
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)^\top
+       X^\top X
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)
+     \Bigr] \\
+    = & \min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \operatorname{tr}\Bigl[
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)^\top
+       S_k^\top S_k
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)
+     \Bigr] \label{eq:2}  \\  
+    = & \min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \Bigl\| S_k S_k^{-1} S_k W_{k,g} - S_k S_k^{-1} P_{k,g} Q_{k,g} \Bigr\|_F^2 \label{eq:3} \\ 
+    = & \min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \Bigl\| S_k W_{k,g} - P_{k,g} Q_{k,g} \Bigr\|_F^2. \label{eq:4}
+\end{align}
+其中从 \ref{eq:2} 到 \ref{eq:3} 的变换依赖引理 ~\ref{lem:Ftotrace} 给出的“Frobenius 范数平方等价于迹”的性质。最终我们把原问题化简为对 $S_k W_{k,g}$ 的低秩近似，即找到秩 $r$ 的 $P_{k,g}$、$Q_{k,g}$ 使得 \ref{eq:4} 的误差最小。若仅对每个分组独立分解，Eckart–Young–Mirsky 定理说明对每个 $S_k W_{k,g}$ 单独做 SVD 并截取前 $r$ 个奇异值即可获得最优解。但Palu\cite{} 的实验与THINKV\cite{} 的理论分析进一步指出：把所有分组的矩阵按列拼接成$[S_k W_{k,1},\dots,S_k W_{k,G}]$ 再做一次联合 SVD，能让主要奇异值集中在共享子空间中，整体重构误差显著低于逐分组分解。因此，我们在实现时采用“先拼接、后分解”的策略，从联合 SVD 中一次性计算所有分组的 $P$和$Q$。由于参数矩阵$W_k$本来就是由$[W_{k,1},\dots,W_{k,G}]$按列拼接而成，因此直接对$S_kW_k$做SVD即可。
+
+通过这种方式，我们就能给 Key 投影找到一套“先预变换再分解”的流程：先利用 $S_k=L^\top$ 将激活协方差吸收到 $S_kW_{k,g}$ 中，再在这一坐标系里做标准的低秩近似。为了保证推理阶段仍能恢复原始尺度，我们只需要在缓存侧保存 $XS_k^{-1}P_{k,g}$，需要完整 Key 时再右乘 $Q_{k,g}$ 即可。并且需要注意的一点是，由于$S_kW_{k,g}$注意力分组在其列上，因此对其做SVD之后，只有$Q_{k,g}$是每组不同的，而$P_{k,g}$对每组是相同的，可以去掉下标$g$用$P_{k}$来表示，因此只需要存储一份$XS_{k}^{-1}P_k$。
+
+\subsection{注意力-激活感知的Value投影低秩分解}
+同样地，为了能够通过低秩分解并存储中间值的范式对Value缓存进行压缩，我们也需要对原本分解的目标$W_v$做一定变换。与对$W_k$进行变换时只考虑激活值不同，$W_v$在注意力层中还需要与注意力分数做矩阵乘法计算，并且Value的每个组要分别和$\left\lfloor \frac{H}{G} \right\rfloor$个不同的注意力分数$A_{g,h}$相乘，因此优化问题也更复杂一些。ALRD\cite{}中给出了求解建模注意力和激活值影响下对变换后的参数矩阵$W_v$做低秩近似的一种方案，而本文中进一步考虑了由于每个注意力组的$W_{v,g}$要与不同的注意力分数进行计算导致的差异，对每个$W_{v,g}$分别进行了不同的变换，即分别对其乘以不同的$S_{v,g}$，赋予了变换矩阵更大的自由度。
+
+由于每个注意力组都包含$H$个注意力头，一共有$G$个注意力组，因此优化目标需要在注意力组和每组内的注意力头这两个维度进行求和：
+\begin{equation}
+\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^h\bigl\|A_{g,h}XS_{v,g}^{-1}S_{v,g}W_{v,g}-A_{g,h}XS_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr\|_F^2,
+\end{equation}
+其中$P_{v,g}Q_{v,g}$是对$S_{v,g}W_{v,g}$的低秩近似。由引理~\ref{lem:Ftotrace}可以将上式写成矩阵转置乘矩阵的迹的形式。
+\begin{align}
+&\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\bigl\|A_{g,h}XS_{v,g}^{-1}S_{v,g}W_{v,g}-A_{g,h}XS_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr\|_F^2 \\
+= &\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\bigl\|A_{g,h}X\bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)\bigr\|_F^2
+\\
+= &\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       X^\top A_{g,h}^\top A_{g,h} X
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr]
+\end{align}
+由于求和的元素中只有$A_{g,h}$和头的索引有关，因此对头的求和号等价于只作用与$A_{g,h}$，因此上式可以推导为:
+\begin{align}
+&\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       X^\top A_{g,h}^\top A_{g,h} X
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr] \\
+     = & \min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       \bigl(\sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X\bigr]\bigr)
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr]
+\end{align}
+我们继续对每个注意力组的$\sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X\bigr]$做cholesky分解，并将分解得到的矩阵赋值给每个注意力组的$S_{v,g}$：
+\begin{equation}
+    \sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X\bigr] = S_{v,g}^\top S_{v,g}
+\end{equation}
+将$S_{v,g}^\top S_{v,g}$代入到前式继续推导得：
+\begin{align}
+& \min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       \bigl(\sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X\bigr]\bigr)
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr] \\
+= & \min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       S_{v,g}^\top S_{v,g}
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr]
+\end{align}
+根据引理~\ref{lem:Ftotrace}，将迹的形式变为F范数平方的形式：\begin{align}
+& \min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       S_{v,g}^\top S_{v,g}
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr] \\
+    = & \min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\bigl\|S_{v,g}W_{v,g}-P_{v,g}Q_{v,g}\bigr\|_F^2
+\end{align}
+与对$S_kW_k$所有的注意力组进行联合分解代替逐个分解相同，为了进一步减少信息的损失，我们对每个注意力组的矩阵按列拼接成$[S_{v,1} W_{v,1},\dots,S_{v,G} W_{v,G}]$ 再进行联合分解。对Key进行低秩近似时直接对$W_k$乘以$S_k$再分解就能起到联合分解的效果，但对Value分解时由于每个注意力组乘的$S_{v,g}$不同，因此需要逐个组计算$S_{v,g}W_{v,g}$并拼接之后再分解。我们将 $[S_{v,1} W_{v,1},\dots,S_{v,G} W_{v,G}]$的拼接与联合 SVD 操作可视化在图\ref{fig:dec_and_rec}中。
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\linewidth]{figures/dec_and_rec.pdf}
+    \caption{$W_v$的变换，拼接和联合分解}
+    \label{fig:dec_and_rec}
+\end{figure}
+
+由于注意力组的划分是在参数矩阵$W_v$的列上的，因此对其变换并进行SVD之后每个注意力组是共享同一个$P_v$的，而$Q_{v,g}$则是每组不同的。需要特别考虑的一个问题是，Value 在逆变换阶段无法像 Key 那样共享一个全局的 $S^{-1}$。Key 的变换矩阵在所有分组间一致，因此我们可以一次性用 $S_k^{-1}$ 计算得到缓存中的 $XS_k^{-1}P_{k}$。而 Value 为了兼顾注意力分布在每组的差异，对每个分组都引入了独立的 $S_{v,g}$。因此复原Value时必须对每组的低秩重建应用对应的逆变换矩阵。缓存的低维Value矩阵$\widehat{V}$为：
+\begin{equation}
+    \widehat{V} = \bigl[XS_1^{-1}P_v,...,XS_G^{-1}P_v\bigr]
+\end{equation}
+是由每个注意力组的$XS_g^{-1}P_v$拼接而成。其特征维度由原本的$d$变成了$G\times r$。需要存储在V缓存中的矩阵大小反而更大了，这是每个注意力组的逆变换矩阵不同导致的。因此，为了解决该问题，我们需要人为控制每个注意力组的逆变换矩阵$S_{v,g}^{-1}$相同。我们这里提出的解决方案是通过求解优化问题得到一个公用的$S_{v}^{-1}$，使得通过$S_{v}^{-1}$计算得到的降维Value缓存与实际的Value缓存之间的差异最小，这个思路可视化在图\ref{fig:S_approximate}中。
+
+\vspace{-10pt}
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=1\linewidth]{figures/S_approximate.pdf}
+    \caption{用相同$S_{v}^{-1}$近似$\widehat{V}$}
+    \label{fig:S_approximate}
+\end{figure}
+
+我们从最小二乘优化问题的角度求解得到$S_v^{-1}$，求得一个$S_v^{-1}$使分解重建前后的参数矩阵差异最小，即$\bigl[S_1^{-1}P_vQ_{v,g},...,S_G^{-1}P_vQ_{v,g}\bigr]$与$\bigl[S_v^{-1}P_vQ_{v,g},...,S_v^{-1}P_vQ_{v,g}\bigr]$之差的F范数的平方最小：
+\begin{align}
+    & \min_{S_v}\sum_{g=1}^G\bigl\|S_g^{-1}P_{v}Q_{v,g} - S_v^{-1}P_{v}Q_{v,g} \bigr\|_F^2 \\
+= & \min_{S_v}\sum_{g=1}^G\bigl\|\bigl(S_g^{-1} - S_v^{-1}\bigr)P_{v}Q_{v,g}  \bigr\|_F^2
+\end{align} 
+使用引理~\ref{lem:Ftotrace}，将F范数平方的形式转化为矩阵迹的形式：
+\begin{align}
+     & \min_{S_v}\sum_{g=1}^G\bigl\|\bigl(S_g^{-1} - S_v^{-1}\bigr)P_{v}Q_{v,g}  \bigr\|_F^2 \\
+     = &\min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[\bigl(S_g^{-1} - S_v^{-1}\bigr)P_vQ_{v,g}Q_{v,g}^\top P_v ^\top\bigl(S_g^{-1} - S_v^{-1}\bigr)^\top \bigr]
+\end{align} 
+由于$Q_{v,g}$是SVD得到的，因此是正交矩阵，它的转置等于它的逆：$Q_{v,g}Q_{v,g}^\top=I$。将其代入上式：
+\begin{align}
+    &\min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[\bigl(S_g^{-1} - S_v^{-1}\bigr)P_vQ_{v,g}Q_{v,g}^\top P_v^\top \bigl(S_g^{-1} - S_v^{-1}\bigr)^\top \bigr]
+    \\
+    = & \min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[\bigl(S_g^{-1} - S_v^{-1}\bigr)P_v P_v^\top \bigl(S_g^{-1} - S_v^{-1}\bigr)^\top \bigr] \\
+    = &
+    \min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_g^{-1}P_vP_v^\top (S_g^{-1})^\top- S_g^{-1}P_vP_v^\top (S_v^{-1})^\top- S_v^{-1}P_vP_v^\top(S_g^{-1})^\top+S_v^{-1}P_vP_v^\top(S_v^{-1})^\top \bigr] \label{eq:24}
+\end{align}
+
+由于矩阵的迹与矩阵转置的迹相同，并且矩阵求和的迹与矩阵迹求和也相同，因此\ref{eq:24}中的$\operatorname{tr}(S_g^{-1}P_vP_v^\top (S_v^{-1})^\top)$和$\operatorname{tr}(S_v^{-1}P_vP_v^\top(S_g^{-1})^\top)$相等且可以合并：
+\begin{align}
+     & \min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_g^{-1}P_vP_v^\top (S_g^{-1})^\top- S_g^{-1}P_vP_v^\top (S_v^{-1})^\top- S_v^{-1}P_vP_v^\top(S_g^{-1})^\top+S_v^{-1}P_vP_v^\top(S_v^{-1})^\top \bigr] \\
+    \iff & \min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_g^{-1}P_vP_v^\top (S_g^{-1})^\top - 2S_g^{-1}P_vP_v^\top (S_v^{-1})^\top + S_v^{-1}P_vP_v^\top(S_v^{-1})^\top \bigr] \label{eq:25}
+\end{align}
+式子~\ref{eq:25}中的第一项$S_g^{-1}P_vP_v^\top (S_g^{-1})^\top$为定值，与要求优化问题的解$S_v$无关，因此可以将其从优化问题中丢掉：
+\begin{align}
+& \min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_g^{-1}P_vP_v^\top (S_g^{-1})^\top - 2S_g^{-1}P_vP_v^\top (S_v^{-1})^\top + S_v^{-1}P_vP_v^\top(S_v^{-1})^\top \bigr] 
+\\
+= &\min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_v^{-1}P_vP_v^\top(S_v^{-1})^\top -2S_g^{-1}P_vP_v^\top (S_v^{-1})^\top \bigr] \label{eq:26}
+\end{align}
+
+~\ref{eq:26}中的第一项与分组$g$无关，在求和号下相当于乘以了G倍数，求和号可以看作只作用于$2S_g^{-1}P_vP_v^\top (S_v^{-1})^\top$上。
+\begin{align}
+    &\min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_v^{-1}P_vP_v^\top(S_v^{-1})^\top -2S_g^{-1}P_vP_v^\top (S_v^{-1})^\top \bigr] \\
+    = & \min_{S_v}\operatorname{tr}\bigl[G \times S_v^{-1}P_vP_v^\top(S_v^{-1})^\top - 2\sum_{g=1}^G S_g^{-1}P_vP_v^\top (S_v^{-1})^\top \bigr] \label{eq:27}
+\end{align}
+~\ref{eq:27}可以等价于对优化问题除以G，另$\frac{\sum_{g=1}^G S_g^{-1}}{G}=\overline{S_g^{-1}}$：
+\begin{align}
+    & \min_{S_v}\operatorname{tr}\bigl[G \times S_v^{-1}P_vP_v^\top(S_v^{-1})^\top - 2\sum_{g=1}^G S_g^{-1}P_vP_v^\top (S_v^{-1})^\top \bigr] \\
+    \iff & \min_{S_v}\operatorname{tr}\bigl[ S_v^{-1}P_vP_v^\top(S_v^{-1})^\top - 2\overline{S_g^{-1}}P_vP_v^\top (S_v^{-1})^\top \bigr]
+\end{align}
+为了后续推导方便，将与优化目标无关的一项$\overline{S_g^{-1}}P_vP_v^\top\overline{ (S_g^{-1})}^\top$加到优化问题中，相当于一个常数项：
+\begin{align}
+    & \min_{S_v}\operatorname{tr}\bigl[ S_v^{-1}P_vP_v^\top(S_v^{-1})^\top - 2\overline{S_g^{-1}}P_vP_v^\top (S_v^{-1})^\top \bigr] \\
+    \iff & \min_{S_v}\operatorname{tr}\bigl[ S_v^{-1}P_vP_v^\top(S_v^{-1})^\top - 2\overline{S_g^{-1}}P_vP_v^\top (S_v^{-1})^\top + \overline{S_g^{-1}}P_vP_v^\top\overline{ (S_g^{-1})}^\top \bigr] \\
+    = & \min_{S_v}\operatorname{tr}\bigl[\bigl(S_v^{-1}-\overline{S_g^{-1}}\bigr)P_vP_v^\top\bigl(S_v^{-1}-\overline{S_g^{-1}}\bigr)^\top \bigr]
+\end{align}
+最后再由引理~\ref{lem:Ftotrace}，将迹的形式转换为F范数的形式：
+\begin{align}
+ & \min_{S_v}\operatorname{tr}\bigl[\bigl(S_v^{-1}-\overline{S_g^{-1}}\bigr)P_vP_v^\top\bigl(S_v^{-1}-\overline{S_g^{-1}}\bigr)^\top \bigr] \\
+= & \min_{S_v}\bigl\|(S_v^{-1}-\overline{S_g^{-1}}\bigr)P_v\bigr\|_F^2
+\end{align}
+当$S_v^{-1}=\overline{S_g^{-1}}$时该优化问题取得最优解为0，对应的$S_v=\overline{S_g^{-1}}^{-1}$。
+
+通过求解最小二乘问题，我们得到一个误差为0的近似，通过存储对低秩缓存$\hat{V}$的近似$XS_{v}^{-1}P_{v}=X\overline{S_{v}^{-1}}P_{v}$，即可实现将Value缓存从原本的$L\times d$大小压缩到$L\times r$大小，在计算注意力时再通过右乘没组对应的$Q_{v,g}$即可复原回低秩的Value近似。
+
+\subsection{变换矩阵$S$的计算}
+根据前文中我们的激活感知的 Key 投影低秩分解和注意力-激活感知的 Value 投影低秩分解算法，对于$W_k$的变换矩阵$S_k$需要对激活值$X^\top X$计算cholesky分解得到，对于$W_v$的变换矩阵$S_{v,g}$需要对每个注意力组的$\sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X \bigr]$进行cholesky分解得到。因此在计算变换矩阵并对变换后的参数矩阵进行分解之前，需要先得到激活值和注意力分数。我们采用离线校准的策略策略，选取一部分数据集作为校准集，让模型在这部分校准集上推理并记录激活值和注意力分数，来计算变换矩阵。
+
+为了考虑到不同语言上激活值和注意力分数的分布，使压缩之后的模型有更好的泛化性，我们选取了英文和中文数据集作为校准集计算变换矩阵。设校准集上共有$N$个样本，对于Key和Value需要进行cholesky分解的矩阵分别为$C_k$和$C_{v,g}$:
+\begin{equation}
+  C_k = \frac{1}{N}\sum_{i=1}^{N} X_i^\top X_i,\qquad
+  C_{v,g} = \frac{1}{N}\sum_{i=1}^{N}\sum_{h=1}^{H} X_i^\top A_{g,h,i}^\top A_{g,h,i} X_i.
+  \label{eq:offline_cov}
+\end{equation}
+为提升数值稳定性，我们遵循 Tikhonov 正则化做对角线平移：$C \leftarrow C + \lambda I$，其中$\lambda$由层宽度自适应设定（经验上取$10^{-4}\|C\|_F / d$）。随后对正定矩阵$C_k$和$\{C_{v,g}\}$分别执行 Cholesky 分解获得$S_k$以及$\{S_{v,g}\}$的值。
+
+\section{本章小结}
+本章围绕“注意力和激活值感知的低秩 KV 缓存特征压缩”展开，从理论动机、算法推导到实现逐层展开论述，旨在克服传统固定低秩分解在跨任务场景下泛化能力弱和误差放大的问题。通过回顾 SVD 低秩逼近与 GQA 架构的基础知识，我们强调了推理阶段真正被使用的是 $XW_k$ 与 $AXW_v$ 等复合项，因此需要在优化目标中显式纳入激活与注意力信息。
+
+在 Key 通道上，我们构造激活感知的预变换 $S_k$，并证明对 $S_kW_k$ 进行联合 SVD 能够获得与真实推理误差一致的最优低秩解；在 Value 通道上，我们进一步引入注意力能量，分别对每个注意力组构造 $S_{v,g}$，再通过联合分解捕获跨组共享的主能量方向。针对多组逆变换导致的缓存膨胀问题，推导了公共 $S_v^{-1}$ 的最小二乘解，并提出基于算术平均的有效近似，使压缩后缓存大小稳定在 $L\times r$ 级别。
+
+本章的主要贡献可概括为：
+\begin{itemize}
+  \item 提出兼顾激活值与注意力分布的低秩目标函数，理论上对齐模型推理阶段的真实矩阵乘计算，从而降低误差；
+  \item 设计基于 Cholesky 变换的联合分解流程，让 Key/Value 的奇异子空间共享统计信息，并支持 GQA 场景下的多组协同压缩；
+  \item 给出统一逆变换的构造方法，在不增加缓存尺寸的前提下恢复各组低秩 Value；
+  \item 讨论离线校准集统计激活值和注意力分数的细节，为后续部署提供可行方案。
+\end{itemize}
+
+上述方法保持了 SVD 的可解释性，又充分利用推理阶段的统计特征，为后续讨论奠定了分析工具。接下来的“层间压缩率分配方案”章节将给出在已有本章推导出的变换矩阵和分解目标基础上，如何在不同层间分配秩预算、动态调节 Key/Value 压缩比的策略，从而在整体显存约束下获得最优的精度-成本折中。

@@ -1,0 +1,795 @@
+\chapter{实验设计与结果分析}
+\label{chap:exp}
+本章面向多个评测维度系统验证所提压缩方案的有效性：我们在语言建模任务上考察困惑度与KV缓存压缩效果，验证我们的"注意力-激活感知"的低秩近似算法和层间秩分配策略以及低秩感知的量化方法对序列建模基础指标的影响；在长上下文理解领域，我们在不同长文本任务类型（覆盖传统一问一答式问答、检索增强推理、事件排序、结构化信息抽取等），重点评估模型在8k以上词元的长文本输入下是否仍能稳定保持性能；我们也在常识推理任务进行了测评以考察压缩后的模型在语义完形填空、常识匹配方面的鲁棒性；最后，我们还对模型在中文标准化考试场景下的性能进行了测试，覆盖理工、人文、社科多学科，能综合检验模型跨领域知识与推理能力。在这些任务之上，我们报告困惑度、Rouge、准确率、F1分数等多种指标，形成一个覆盖多种生成与判别场景的综合评测。
+
+在模型与设置方面，为了验证我们提出的KV缓存压缩算法的泛化性，我们选取了不同的大模型，分别在较低压缩率30\%，适中KV压缩率50\%下进行了特征维度压缩算法和Value的低秩感知量化方法的评估，并在更高的压缩率(75\%和87.5\%)下结合“低秩特征压缩+量化压缩”进行了低秩感知的混合精度量化算法的评估。上下文长度则覆盖常见的1k以下的短文本，中等长度文本4K/8K，乃至更长的32K，以此观察压缩策略在长文本下的稳定性。为了保证结论严谨，我们首先使用~\ref{chap:scaling_svd}和~\ref{chap:rank_search}小节提出的“注意力-激活感知低秩分解 + 层间秩重分配”方案（未启用量化）与当前SOTA的SVD特征维压缩基线方法做逐项对比，分析在相同 rank 预算下的性能差异，并使用~\ref{chap:quant_low_rank}小节提出的低秩感知量化方案替换丢弃Value尾部奇异值的压缩方式验证其相较于“非1即0”的秩丢弃能够在相同压缩率下进一步减少模型精度损失；为了验证本研究提出的压缩方式在不同压缩率下的泛化性，我们在较低的压缩率下验证了“注意力-激活感知低秩分解 + 层间秩重分配”几乎无损的压缩效果，并在高压缩率下使用低秩感知的混合精度量化结合SOTA的量化方案和我们的特征压缩方式，观察更高压缩率预算下与单一量化技术路线的SOTA方法的性能差异；除了模型精度的比较，我们还与完整模型在不同输入序列长度下比较了模型推理时的显存占用，来直观展现我们方法的压缩效果；消融实验部分，我们分别验证了我们的低秩近似算法和秩分配算法的有效性，并对比了我们对Value的低秩感知的量化压缩与“低秩裁剪后量化”、对完整Value直接量化的效果差异。%为了验证低秩感知的混合精度量化压缩在，观察更高压缩率预算下与单一量化技术路线的SOTA方法的性能差异。
+本章节中通过在多任务类型，多种大模型，不同压缩率下进行实验和消融，展示了我们的方案在不同任务，不同长度上下文场景中的优势、鲁棒性及可拓展性。
+
+\section{实验数据集与评估指标}
+\label{sec:datasets}
+为了全面评估所提出压缩策略对模型能力的影响，本章按任务类型将实验数据集划分为三个层面：首先在语言建模基准上计算困惑度，量化压缩对基础序列建模质量的影响；随后在多样化的零样本推理任务上以准确率衡量知识与常识推理的保持程度；最后在 LongBench 长上下文基准上覆盖 21 个子任务，使用 F1、Rouge-L、Accuracy、Edit Similarity 等指标考察模型在文本生成、问答、分类与代码补全等复杂场景中的表现。下面依次介绍各类数据集与评估方式。
+\subsection{语言建模与困惑度}
+困惑度（Perplexity, PPL）是衡量语言模型预测给定语料能力的经典指标，其本质是序列中每个词元的平均负对数似然的指数形式。设测试集包含 $N$ 个词元，模型对第 $i$ 个 词元的条件概率为 $p_\theta(w_i \mid w_{<i})$，表示在第$i$个词元之前的所有词元已知的条件下，模型预测的下一个词元是序列样本中真实的第$i$个词元的概率，则困惑度定义为
+\begin{equation}
+    \mathrm{PPL} = \exp\left(-\frac{1}{N} \sum_{i=1}^{N} \log p_\theta(w_i \mid w_{<i})\right).
+\end{equation}
+困惑度越低，说明模型越能贴近真实数据分布、准确预测样本中的下一个词元。对于 KV 缓存压缩方案而言，困惑度能够最直接地反映压缩带来的语言建模能力损失：若压缩破坏了注意力或隐状态表示，模型对后续词元的概率分布会偏离，从而显著提升困惑度。为保证对比公平，我们在评估时固定 tokenizer、上下文长度、最大生成步数以及解码温度等因素，确保困惑度差异主要来自压缩策略本身。
+
+在语言建模基准方面，我们选用 WikiText-2\cite{merity2016pointer} 与 Penn Treebank（PTB）\cite{marcus-etal-1993-building}两个经典数据集对压缩后模型的效果进行测评。WikiText-2 来源于维基百科精选条目，保留原始大小写、标点与引用信息，语料规模约 200 万词，句子较长并带有自然的跨句上下文，能够反映真实文本中复杂语法与实体共指等现象。PTB 则基于《华尔街日报》语料，经过严格清洗与词表压缩（约 100 万词），移除了数字与大部分标点，句式更为规整，常用于测试模型在小词表、正式文体下的建模能力。我们分别在这两个数据集上记录各类压缩方案的困惑度，该实验既能量化语言层面损失，也为后续更复杂任务的表现提供参考上限。
+
+\subsection{零样本推理}
+在零样本推理（zero-shot）设置下，我们直接使用模型在预训练阶段学到的知识与推理能力，不提供额外监督信号进行微调或少样本提示，而是通过纯粹的 prompt 结构要求模型给出答案。为了全面评估压缩策略对模型本身的能力产生的影响，我们选取以下常用的零样本基准，并统一使用准确率（Accuracy）作为评测指标：
+\begin{itemize}
+    \item 
+    \textbf{BoolQ\cite{clark2019boolq}}：是一个面向“是/否”问题的自然问答数据集，共包含 12,697 个样例，其中训练集 9,427 条、验证集 3,270 条。每个样例由（问题，证据段落，布尔答案）组成，问题来自用户在无提示、无约束环境中生成的自然查询，证据段落及可选的页面标题来自 Wikipedia。BoolQ 的文本长度跨度较大（从约 35 token 到 4.7K token），既包含短问题，也涵盖多段长文；其二分类形式与自然语言推断任务类似，评估模型能否依据证据段落对问题做出正确的“是/否”判断。
+    \item \textbf{HellaSwag\cite{zellers2019hellaswag}}：常识推理数据集“Can a Machine Really Finish Your Sentence?”，定位于带有多选结尾的自然语言推断任务，核心目标是让模型在给定上下文下完成最合理、最自然的句子续写。数据集中包含 39,905 条训练样本、10,042 条验证样本和 10,003 条测试样本，每条样本由一个描述性上下文和 4 个候选结尾构成（其中只有一个正确）。为提升难度，干扰选项由强大的语言模型生成并经过人工筛选，极具迷惑性，因此非常适合衡量压缩后模型在常识与语义连贯性上的保真度。
+    \item \textbf{OpenBookQA\cite{mousi2024aradicebenchmarksdialectalcultural}}：旨在推动“开放式教科书考试”风格的高级问答研究，数据集中附带一本概括科学核心事实的“Open Book”，每个问题都需要结合该书中的显式知识以及额外的常识或科学推理才能解答。数据总量 5,957 条，其中训练/验证/测试集分别为 4,957/500/500。题目形式为四选一，强调多步推理、补充知识调动与复杂文本理解，其目标是考察模型是否能在压缩之后仍保持对科学概念与自然语言表达的深入理解。
+    \item \textbf{ARC-C / ARC-E\cite{allenai:arc}}：AI2 Reasoning Challenge（ARC）收集了 7,787 道真实的小学科学多选题，旨在推动高级推理式问答研究。数据集按照难度划分为 Challenge（C）与 Easy（E）两部分：Challenge 子集中保留了检索式算法与共现式算法均答错的问题，更强调对复杂语言描述和隐含常识的推理；Easy 子集则包含相对直接的题目。我们使用 ARC 官方提供的分割，C/E 两部分的训练/验证/测试样本分别为 1,119/299/1,172 与 2,251/570/2,376。评估时模型需从四个选项中选出正确答案，该任务有助于检验压缩后模型在科学问答场景下的多步推断能力。
+    \item \textbf{Winogrande\cite{ai2:winogrande}}：是对 Winograd Schema Challenge 的大规模扩展，共收录约 44K 个常识推理问题。每道题以填空形式呈现，给出两种可选词或短语，需要模型理解句子中的事件关系与指代逻辑，选择更合理的填入空缺。数据集经过专门设计以缓解原始 WSC 的偏置，更适合评估压缩之后的模型在代词消解与常识推理方面的鲁棒性。
+    \item \textbf{PIQA\cite{Bisk2020}}：Physical Interaction: Question Answering 数据集专注于物理常识推理，典型问题如“在没有眼影刷的情况下，是用棉棒还是牙签更适合上眼影？”这类情境要求模型具备对工具使用、安全性和日常物理常识的理解。每个样例提供一个短描述和两个操作选项，模型需判断哪一个更可行、更符合现实。PIQA 的目标是推动具备物理互动理解能力的自然语言系统，准确率能直接衡量压缩后模型在物理常识推断方面的表现。
+    \item \textbf{CEval\cite{huang2023ceval}}：一个面向中文大模型的综合测评套件，覆盖 52 个学科、共 13,948 道多选题，按难度划分为四个层级，领域涉及理工、社科、人文、医学等。每个子科目提供 dev/val/test 三个子集：dev 含 5 个带解析的示例（可用于 few-shot 提示），val 用于调参数，test 用于最终评估。我们在零样本设定下，直接对 test 部分进行预测并统计准确率，用以衡量压缩方案在中文多学科知识与推理方面的表现。
+\end{itemize}
+
+在这些数据集上，我们按照官方的零样本推理输入格式，直接让模型输出答案，并统计预测准确率。由于 准确率 是一个统一的离散指标，能够方便地比较不同压缩策略在多任务零样本推理中的性能差异，也能帮助分析压缩对“无需额外监督即可完成任务”的影响。我们在表格中分别汇报未量化的低秩方案、叠加混合精度量化以及其他基线方法的准确率，展示在低比特与层间秩分配下模型知识推理能力的保持情况。
+
+\subsection{LongBench 长上下文评测}
+LongBench\cite{bai2023longbench} 覆盖 6 大任务类型、共 21 个子任务，旨在系统评估模型在长上下文语境下的能力：Multi-doc QA（包含HotpotQA、2WikiMultihopQA、MuSiQue、DuReader，需要在多篇英文或中文文档中检索相关信息并回答问题，其中 DuReader 为中文多文档问答）、Single-doc QA（MultiFieldQA-en/zh 涵盖多领域长文、NarrativeQA 针对故事或剧本、Qasper 面向自然语言处理论文提问），Summarization（GovReport 政府报告摘要、MultiNews 多新闻摘要、QMSum 面向会议记录的查询式摘要、VCSUM 中文会议摘要）、Few-shot（TriviaQA、NarrativeQA 的单文档 QA Few-shot 设定、SAMSum 对话摘要 Few-shot、TREC 问题分类 50 类、LSHT 中文新闻分类 24 类）、Synthetic（PassageRetrieval-en/zh 按摘要反推段落、PassageCount 统计重复段落数量）以及 Code（LCC 在单文件长代码中预测下一行、RepoBench-P 在跨文件仓库代码中做下一行预测）。我们在上述中英文混合基准上运行实验，输入长度范围最长达到32K+ tokens，重点考察压缩方案在极长上下文情况下的稳定性与泛化能力。由于LongBench由多种类型的不同子任务构成，因此子任务之间也需要使用各自的评测指标。在LongBench中用于评测的指标如下： 
+\begin{itemize}
+    \item \textbf{F1}：针对抽取式问答或文本匹配场景，先逐个词元（或逐字）计算预测答案与参考答案之间的精确率（precision）和召回率（recall），再取二者的调和平均。相比单纯的精确率或召回率，F1 能同时考虑答案是否覆盖了所有关键信息以及是否引入多余内容，因此更适合衡量模型在长上下文问答中的综合表现。
+    \item \textbf{Rouge-L}：用于摘要与生成式问答任务，基于预测文本与参考摘要之间的最长公共子序列（Longest Common Subsequence, LCS）计算得分。Rouge-L 会综合考虑 LCS 长度与预测/参考的整体长度，既反映预测内容对参考关键信息的覆盖程度，也考察句子级别的顺序一致性，是长文本摘要的标准衡量指标。
+    \item \textbf{Accuracy}：对分类或离散选择类任务，直接统计预测选项与标准答案完全一致的比例。该指标不依赖于序列级匹配，计算简单、解释直观，适合衡量长上下文 Few-shot 分类、段落检索等需要“一次性给出正确答案”的任务。
+    \item \textbf{Edit Similarity}：主要用于代码或结构化生成任务，以编辑距离（Edit Distance）衡量预测序列与参考序列之间的最小编辑操作数，并将其归一化得到相似度分数。该指标对单字符/单 token 的增删改都敏感，能够细致反映长代码生成在语法和结构层面的准确性。
+\end{itemize}
+更具体地，我们将21个子任务各自所属的任务类型，评测指标，样本平均长度，任务使用的语言以及样本数量展示在表~\ref{tab:longbench-tasks}中。
+\begin{table}[htbp]
+    \centering
+    \caption{LongBench 子任务概览}
+    \label{tab:longbench-tasks}
+    \begin{tabular}{lccccc}
+        \toprule
+        \textbf{任务} & \textbf{任务类型} & \textbf{测评指标} & \textbf{样本平均长度} & \textbf{语言类型} & \textbf{样本数} \\
+        \midrule
+        HotpotQA & Multi-doc QA & F1 & 9{,}151 & EN & 200 \\
+        2WikiMultihopQA & Multi-doc QA & F1 & 4{,}887 & EN & 200 \\
+        MuSiQue & Multi-doc QA & F1 & 11{,}214 & EN & 200 \\
+        DuReader & Multi-doc QA & Rouge-L & 15{,}768 & ZH & 200 \\
+        MultiFieldQA-en & Single-doc QA & F1 & 4{,}559 & EN & 150 \\
+        MultiFieldQA-zh & Single-doc QA & F1 & 6{,}701 & ZH & 200 \\
+        NarrativeQA & Single-doc QA & F1 & 18{,}409 & EN & 200 \\
+        Qasper & Single-doc QA & F1 & 3{,}619 & EN & 200 \\
+        GovReport & Summarization & Rouge-L & 8{,}734 & EN & 200 \\
+        QMSum & Summarization & Rouge-L & 10{,}614 & EN & 200 \\
+        MultiNews & Summarization & Rouge-L & 2{,}113 & EN & 200 \\
+        VCSUM & Summarization & Rouge-L & 15{,}380 & ZH & 200 \\
+        TriviaQA & Few shot & F1 & 8{,}209 & EN & 200 \\
+        SAMSum & Few shot & Rouge-L & 6{,}258 & EN & 200 \\
+        TREC & Few shot & Accuracy & 5{,}177 & EN & 200 \\
+        LSHT & Few shot & Accuracy & 22{,}337 & ZH & 200 \\
+        PassageRetrieval-en & Synthetic & Accuracy & 9{,}289 & EN & 200 \\
+        PassageCount & Synthetic & Accuracy & 11{,}141 & EN & 200 \\
+        PassageRetrieval-zh & Synthetic & Accuracy & 6{,}745 & ZH & 200 \\
+        LCC & Code & Edit Sim & 1{,}235 & Python/C\#/Java & 500 \\
+        RepoBench-P & Code & Edit Sim & 4{,}206 & Python/Java & 500 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+在实验中，我们遵循 LongBench 官方代码中的统一提示格式与分词策略，逐子任务汇报上述指标，并与其他的KV缓存特征维度压缩方法进行比较，检验“低秩+混合精度+可控粒度”策略在多类型长上下文任务中的泛化能力。
+
+
+\section{实验模型与设置}
+为了验证压缩策略在不同架构的大模型下的适应性，我们选择两个主流指令微调后的模型Llama3.1-8B-Instruct\cite{dubey2024llama}和Qwen2.5-7B-Instruct\cite{team2024qwen2}作为评测我们KV缓存压缩策略的压缩对象，分别代表国内外的经典开源大模型。其中Llama3.1-8B-Instruct的KV缓存特征维度为1024，Qwen2.5-7B-Instruct的KV缓存特征维度为512，分别代表原本KV特征维度适中和较低的模型，KV缓存本身特征维度越小对低秩分解压缩特征维也越敏感，因此能够用以探究我们的方法在适中和较低KV特征维度的模型上的表现。我们的主要实验在Llama3.1-8B-Instruct和Qwen2.5-7B-Instruct上进行，消融实验部分主要使用Llama3.1-8B-Instruct。
+
+\textbf{Llama3.1-8B-Instruct：}\space Llama 3.1 是 Meta 最新一代的开源基础模型系列，8B 版本在参数规模与推理成本之间取得平衡，采用标准的 decoder-only Transformer 架构，搭配持续优化的自回归训练策略与高质量混合语料。官方 Instruct 版本对原始模型进行了 RLHF、拒答/安全微调和风格调优，使其在指令遵循、对话问答、摘要生成等任务上保持稳定、可控的输出。该模型具备较长的上下文窗口和良好的多语言支持能力，支持128k的prompt长度，也是开源社区常用的实验基准之一。
+
+\textbf{Qwen2.5-7B-Instruct：}\space Qwen2.5 延续了 Qwen 系列的 Transformer 架构，7B Instruct 版本在大规模跨领域语料（包括技术文档、对话语料、知识图谱扩展文本等）上训练，并结合高质量的指令集做监督微调与 RLHF。模型支持多语言混合分词，内置工具调用与函数描述学习能力，在问答、对话、长文本任务上表现突出，支持128k的prompt长度。官方提供的 Instruct 版本还包含安全过滤与格式化输出能力，使其在指令式评测中有更好的稳定性。
+
+在实验中，我们保持以上两种模型的原始权重与推理配置不变，只在推理阶段施加不同的 KV缓存压缩策略，然后统一在~\ref{sec:datasets}的多种数据集上对比评估困惑度、准确率以及 LongBench 指标，以验证所提方法在不同预训练语料与对齐范式下的通用性。
+
+\paragraph{实验设置} 所有实验均在配备 NVIDIA L20（48GB 显存）的服务器上完成。我们主要在50\%压缩率的场景下将我们"低秩分解+层间秩分配"方法与特征维压缩的基线方法进行了对比实验，同时也验证了我们的方法在较低压缩率30\%下的效果。在更高的压缩率(75\%，87.5\%)下，我们将提出的低秩感知的混合精度量化方法与量化压缩的基线方法进行了对比。本论文提出的KV压缩算法的具体实验设置如下：
+\begin{itemize}
+    \item 在 ~\ref{chap:scaling_svd} 中用于构建变换矩阵的校准集，英文部分采样自 BoolQ 训练集的 512 个样本，中文部分采样自 DuReader 训练集的 128 个样本。二者覆盖“是/否”问答和多文档中文 QA，有助于估计激活/注意力感知矩阵所需的统计量。
+    \item 在 ~\ref{chap:rank_search} 的层间秩分配算法中，为了提升效率，我们的校准集由英文数据集 PIQA 训练集采样的32 个样本以及中文数据集 VCSUM采样的16个样本构成。由于秩的变化敏感性与误差累积更偏向于模型自身特性，即便样本量较小也能稳定反映趋势。
+    \item ~\ref{chap:rank_search}中的层间秩传递的超参数设置为：最大迭代步数 20，每次秩调整（Key 与 Value 独立计算）的学习率 $\eta = 0.4$，并在所有实验中固定。每次rank传递的最小步长设置为$0.05\times d$，最大步长设置为$0.2 \times d$，其中$d$为完整KV缓存的特征维度大小。若达到最大步数或连续多轮无提升，则按照~\ref{chap:rank_search}章节描述提前停止。
+\end{itemize}
+
+\section{基线方法的选取}
+为了验证我们方法的效果，我们选取了一些简单方法和目前的SOTA方法作为基线方法。首先我们对比了通过低秩分解来减少KV缓存特征维度实现压缩的方法，在不同数据集上保持统一的KV缓存压缩率与我们方法对比模型精度损失。为了进一步验证"低秩感知的混合精度量化策略"的效果，本研究还选择了单从量化这条技术路线出发压缩KV缓存的SOTA方法作为基线方法。下面将详细对我们选取的对比对象进行介绍：
+\begin{itemize}
+    \item \textbf{基于SVD的特征降维方法：}
+    \begin{itemize}
+    \item \textbf{SVD：} 简单的低秩分解存储中间值来压缩KV缓存的方案。依据Eckart-Young 定理保证的SVD分解的低秩近似最优性，直接对$W_k$和$W_v$进行SVD分解得到$P_kQ_k$和$P_vQ_v$并丢弃一部分奇异值和奇异向量，作为原本参数矩阵的近似。存储$XP_k$和$XP_v$代替原本KV缓存来压缩特征维度。
+    \item \textbf{ASVD\cite{yuan2023asvd}：} 在对参数矩阵$W_k$和$W_v$进行SVD分解时，考虑到了参数矩阵与激活值进行矩阵乘法计算时激活值会根据自身不同元素的幅值对低秩分解误差矩阵的不同通道进行不同维度的放大，导致原本对参数矩阵的最优低秩近似SVD不再是最优。激活值$X$与参数矩阵$W$相乘可以看作$X$的每一列与$W$的每一行的外积再求和。因此ASVD使用激活值$X$每一列的平均幅值构建了一个对角矩阵$S$，先用$S$与$W$相乘变换之后再进行SVD分解并做低秩近似$SW=PQ$，再对$P$左乘$S^{-1}$作为计算KV缓存的低秩投影参数矩阵，推理时对KV缓存中间值右乘$Q$得到低秩近似的KV。
+    \item \textbf{Palu\cite{chang2025palu}：} 同样地在对参数矩阵$W_k$和$W_v$做SVD分解时考虑到了激活值$X$的影响，并且更进一步地将激活值对低秩近似的影响构造成了一个优化问题的求解。由于其对Key和Value求解的优化问题一致，因此下面模型参数统一用$W$表示。Palu中的优化的目标为低秩近似降维KV缓存的前后，KV缓存的差异尽可能小，即$\min\bigl\|XW-XW_{\text{low rank}}\bigr\|$。其使用的低秩分解范式也是对$W$乘一个变换矩阵$S$之后再对其进行SVD，并对低秩分解得到的$P$矩阵左乘逆变换矩阵$S^{-1}$保持计算结果一致，优化问题变为$\min_{P,Q}\bigl\|XS^{-1}SW-XS^{-1}PQ\bigr\|$。与我们在\ref{sec:key_decomposition}中求解的方式一致，Palu也参考SVD-LLM\cite{wangsvd}中的思路通过对激活值的协方差矩阵进行cholesky分解来得到变换矩阵$S$。%由于求解的优化问题与模型推理时的目标保持一致，因此Palu是此前低秩分解压缩KV缓存特征维度的state-of-the-art方法。
+    除此之外，Palu发现逐个注意力头对参数矩阵分解重建速度更快但效果差，而对所有注意力头（即整个参数矩阵）进行分解重建效果更稳定但速度偏慢。因此设计了一个折衷的方案，对所有的注意力头（GQA则是KV的注意力组）进一步分成几个组，每个组内进行低秩分解再将得到的$PQ$逐个组重建为近似的参数矩阵。为了与其公平对比，我们实验中Palu的设置都是所有注意力组联合分解以保证其最大性能。
+        \end{itemize}
+     \item \textbf{基于量化的压缩方法：}
+     
+     \begin{itemize}
+         \item \textbf{KVQuant\cite{hooper2024kvquant}:} 低精度量化面临的主要问题是KV缓存存在离群值。KVQuant发现Key进行RoPE后离群值现象会更明显，因此提出在RoPE之前对Key进行量化。为了进一步缓解离群值的影响，KVQuant提出了混合精度量化，对于离群值采用全精度保留，其他值则进行低精度量化。引入了费希尔信息量在一部分校准集上进确定应该保留哪些离群值，且设计了每向量稠密-稀疏混合存储策略减少低精度量化下模型性能下降。KVQuant能够在将模型KV缓存压缩到2比特的情况下保持模型效果不会过于劣化。
+         \item \textbf{KIVI\cite{liu2024kivi}：}通过实验观察到Key和Value缓存中异常值分布不同，对KV采取了不同维度的量化方案。对于Key缓存，异常值往往集中在某些特定通道，因此采用通道级量化来减少离群值影响；对于Value缓存，则使用词元级量化。由于最近的词元往往比较重要，因此KIVI对于它们的KV缓存保留全精度，缓存中其余的词元进行分组的低比特量化。 在KV缓存的2比特压缩下，KIVI仍能保持模型精度不会严重下降。
+     \end{itemize}
+\end{itemize}
+
+\section{实验结果与分析}
+
+\subsection{主要实验结果}
+本小节主要展示了通过我们的低秩分解方案与层间秩分配算法压缩后的模型在多种任务类型：语言建模任务，零样本推理任务和长文本推理任务上的效果。测试了模型通过我们的方法压缩到50\%的整体压缩率下，与之前的SOTA方法压缩到50\%压缩率的效果对比。同时也验证了较低压缩率(30\%)下，我们的方法几乎不会造成模型性能损失。
+%\subsubsection{语言建模、零样本推理和长文本推理任务}
+%本节主要展示了本研究提出的基于SVD的低秩KV缓存压缩方案在多种任务类型：语言建模任务，零样本推理任务和长文本推理任务上的效果。主要测试了模型的KV缓存通过我们的方法压缩到50\%的整体压缩率下，与之前的SOTA方法压缩到50\%压缩率的效果对比。
+
+\textbf{语言建模任务：} \space 表 ~\ref{tab:lm-ppl} 给出了在两类语言建模数据集（WikiText-2、PTB）上，不同 KV 缓存压缩策略在适中的50\%压缩率下对困惑度（PPL）的影响。首先，在两种模型上，直接对投影矩阵做静态 SVD 会带来最明显的性能退化，尤其在 Qwen2.5-7B-Instruct 上，由于其特征维度本身就相对较少，丢弃秩的影响更大，SVD 的 困惑度从 7.46/13.42 急剧上升到 21.47/32.01，说明仅以参数矩阵的低秩近似为目标并不能保证推理阶段的误差可控。相比之下，引入了推理时激活值影响的改进方法整体更稳定：ASVD 与 Palu 在两模型上均显著优于 SVD，表明利用激活分布进行感知式分解能够有效缓解压缩误差放大。进一步地，我们的低秩压缩方法在两模型两数据集上均取得基于“丢弃尾部秩”的方法中最优结果：以 Llama3.1-8B-Instruct 为例，WikiText-2/PTB 的 困惑度 分别为 8.04/14.09，较 Palu（8.94/15.27）进一步下降；在 Qwen2.5-7B-Instruct 上也将 困惑度 降至 8.62/16.25，优于 ASVD 与 Palu，验证了我们在分解目标中同时引入激活与注意力后，能够更好地保持语言建模能力。最后，我们对Value的低秩感知量化压缩方式在同等压缩率下维持了接近完整模型的困惑度（Llama：7.54/12.81；Qwen：7.76/14.04），说明我们低秩感知的混合精度量化方法相较于直接丢弃Value尾部秩的方式保留了原模型更多信息。
+
+\begin{table}[htbp]
+    \centering
+    \caption{语言建模数据集上的困惑度 ($\downarrow$)：括号内为压缩率，最优的效果用粗体表示，次优的效果用下划线表示。}
+    \label{tab:lm-ppl}
+    \begin{tabular}{llcc}
+        \toprule
+        \textbf{模型} & \textbf{压缩方式} & \textbf{WikiText-2} & \textbf{PTB} \\
+        \midrule
+        \multirow{6}{*}{\textbf{Llama3.1-8B-Instruct}}
+            & 完整模型 & 7.21 & 12.33 \\
+            \cmidrule(lr){2-4}
+            & SVD(50\%) & 9.93 & 17.03 \\
+            & ASVD(50\%) & 9.16 & 15.62 \\
+            & Palu(50\%) & 8.94 & 15.27 \\
+            \cmidrule(lr){2-4}
+            & \textbf{注意力感知低秩压缩(50\%)} & 
+            \underline{8.04} & \underline{14.09} \\
+            & \textbf{低秩感知量化压缩-V(50\%)} & \textbf{7.54} & \textbf{12.81} \\
+            
+            
+            %& \textbf{低秩+量化(25\%)} & \textbf{7.56} & \textbf{12.83} \\
+            \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.8pt]
+        \multirow{6}{*}{\textbf{Qwen2.5-7B-Instruct}}
+            & 完整模型 & 7.46 & 13.42 \\
+            \cmidrule(lr){2-4}
+            & SVD(50\%) & 21.47 & 32.01 \\
+            & ASVD(50\%) & 9.18 & 16.38 \\
+            & Palu(50\%) & 8.71 & 17.44 \\
+            \cmidrule(lr){2-4}
+            & \textbf{注意力感知低秩压缩(50\%)} & \underline{8.62} & \underline{16.25} \\
+            & \textbf{低秩感知量化压缩-V(50\%)} & \textbf{7.76} & \textbf{14.04} \\
+            
+            %& \textbf{低秩+量化(25\%)} & \textbf{7.77} & \textbf{14.07} \\
+        \bottomrule
+    \end{tabular}
+    \vspace{4pt}
+    %\caption*{括号内为压缩率，效果最优的用粗体表示，次优的用下划线表示}
+\end{table}
+
+
+
+\textbf{零样本推理任务：} \space 表 \ref{tab:zeroshot-acc} 进一步在零样本推理任务上验证了各类 KV 压缩方法在50\%压缩率下对“下游能力”的影响。总体来看，朴素 SVD在两种模型上都会带来明显的平均准确率下降，反映出仅做静态低秩近似会破坏注意力层的关键信息通道，导致跨任务泛化能力显著受损。引入激活统计的 ASVD 与 Palu 能有效缓解这一问题，但仍存在稳定差距：在相同 50\% 压缩率下，我们的注意力感知低秩压缩方法在两模型上均取得更高的平均准确率（Llama：68.08，Qwen：71.43），并在多项任务上更接近完整模型，例如 Qwen 的 BoolQ/HellaSwag/ARC-C 等指标基本保持不变，说明我们的方法能更好地对齐推理时真实计算目标，从而减少压缩误差对推理过程的影响。更重要的是，我们对Value的低秩感知量化压缩方案在同等压缩率下仍能保持几乎不降的平均表现（Llama：68.70 vs. 68.77；Qwen：72.65 vs. 72.75），这种保留更多Value信息的压缩方式使得压缩后模型对知识问答、常识推理与中文评测（CEval）等能力维持更鲁棒。
+
+\begin{table}[htbp]
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+    \caption{零样本推理任务上的准确率 (\% $\uparrow$)：括号内为压缩率，最优的效果用粗体表示，次优的效果用下划线表示。}
+    \label{tab:zeroshot-acc}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{ll|c|c|c|c|c|c|c|c|c}
+        \toprule
+        \textbf{模型} & \textbf{压缩方式} & \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OpenBookQA} & \textbf{ARC-C} & \textbf{ARC-E} & \textbf{Winogrande} & \textbf{PIQA} & \textbf{CEval} & \textbf{Avg} \\
+        \midrule
+        \multirow{6}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 完整模型& 84.04  & 79.27  &  43.00 &55.03& 79.59 & 73.95 & 81.01 & 54.23 &  68.77 \\
+            \cmidrule(lr){2-11}
+            & SVD(50\%) & 76.91 & 76.44 & 42.40 & 53.41 & 76.60 & 72.85 &79.87 & 50.22 & 66.09 \\
+            & ASVD(50\%) & 79.85  &  77.44 & \underline{45.40} & 54.27 & 78.28 & \underline{73.88} & \textbf{80.96} & 49.33 & 67.43 \\
+            & Palu(50\%) & 80.95  & 76.88 & \textbf{45.60} & 54.24 & 78.82 & \underline{73.88} & 80.54 & 50.47 & 67.67 \\
+             \cmidrule(lr){2-11}
+            & \textbf{注意力感知低秩压缩(50\%)} & \underline{83.61} &\underline{77.62}  &  43.80 & \underline{54.44}  & \underline{79.21} &  73.48 & 80.47 & \underline{52.01} & \underline{68.08}  \\ 
+            & \textbf{低秩感知量化压缩-V(50\%)} & \textbf{84.22} &\textbf{78.85}  & 44.00 & \textbf{54.86}  & \textbf{79.80} &  \textbf{74.19} & \underline{80.90} & \textbf{52.75} & \textbf{68.70} \\ 
+            %& \textbf{低秩+量化(25\%)} & \textbf{84.13} & \textbf{78.72} & 43.20 & \textbf{54.61} & \textbf{80.01} & \textbf{74.66} & \underline{80.63} & \textbf{52.08} & \textbf{68.51} \\
+            \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.8pt]
+        \multirow{6}{*}{\shortstack{\textbf{Qwen2.5-7B}\\\textbf{-Instruct}}}
+            & 完整模型 & 86.33  & 80.48  &  48.20 & 55.03 & 81.10 & 70.80 & 80.30 & 79.72 &  72.75\\
+            \cmidrule(lr){2-11}
+            & SVD(50\%) &74.22  &  70.40 & 42.80  &  47.44 & 65.99 & 59.12 & 74.43  & 62.26 & 62.08\\
+            & ASVD(50\%) &84.65   &75.29 & 45.60 & 50.00 & 68.82 &68.90  & 76.06 & 73.55 & 67.86\\
+            & Palu(50\%) & 85.38 &  77.20 & \underline{47.40} & 52.47 & 70.83 & 67.56 & 77.91 & \underline{75.48} & 69.28 \\
+             \cmidrule(lr){2-11}
+            & \textbf{注意力感知低秩压缩(50\%)} & \underline{86.02} & \underline{79.23}  & 47.00 & \underline{55.72}  & \underline{79.64}  &  \underline{69.77} & \underline{79.65}  & 74.37 & \underline{71.43}  \\
+            & \textbf{低秩感知量化压缩-V(50\%)} & \textbf{86.27} & \textbf{80.31} & \textbf{47.80} &  \textbf{56.91} & \textbf{81.10}  & \textbf{70.32} & \textbf{79.60} & \textbf{78.90} &\textbf{72.65}  \\
+            
+            %& \textbf{低秩+量化(25\%)} & \textbf{86.24}  & \textbf{80.21} & \textbf{48.20} & \textbf{57.34} & \textbf{80.72} & \textbf{70.32} & \textbf{79.65} & \textbf{78.45} &  \textbf{72.64} \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{括号内为压缩率，效果最优的用粗体表示，次优的用下划线表示}
+\end{table}
+
+\iffalse
+\begin{table}[htbp]
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+    \caption{Llama3.1-8B-Instruct 在零样本推理任务上的准确率 (\%)}
+    %\label{tab:zeroshot-acc-llama}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{l|c|c|c|c|c|c|c|c|c}
+        \toprule
+        \textbf{模型 / 压缩方式} & \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OpenBookQA} & \textbf{ARC-C} & \textbf{ARC-E} & \textbf{Winogrande} & \textbf{PIQA} & \textbf{CEval} & \textbf{Avg} \\
+        \midrule
+        完整模型& 84.04  & 79.27  &  43.00 &55.03& 79.59 & 73.95 & 81.01 & 54.23 &  68.77
+        \\
+        \midrule
+        SVD(50\%) & 76.91 & 76.44 & 42.40 & 53.41 & 76.60 & 72.85 &79.87 & 50.22 & 66.09 \\
+        ASVD(50\%) & 79.85  &  77.44 & 45.40 & 54.27 & 78.28 & 73.88 & 80.96 & 49.33 & 67.43 \\
+        Palu(50\%) & 80.95  & 76.88 & 45.60 & 54.24 & 78.82 &73.88 & 80.54 & 50.47 & 67.67 \\
+        \underline{Ours(50\%)} & \underline{83.61} &\underline{77.62}  &  \underline{43.8} & \underline{54.44}  & \underline{79.21} &  \underline{73.48} & \underline{80.47} & \underline{52.01} & \underline{68.08}  \\
+        \midrule
+        \textbf{低秩+量化(25\%)} & \textbf{84.28} & \textbf{78.82} & \textbf{44.00} & \textbf{54.95} & \textbf{80.01} & \textbf{73.95} & \textbf{81.01} & \textbf{52.97} & \textbf{68.75} \\
+        \bottomrule
+    \end{tabular}}
+\end{table}
+
+\begin{table}[htbp]
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+    \caption{Qwen2.5-7B-Instruct 在零样本推理任务上的准确率 (\%)}
+    %\label{tab:zeroshot-acc-qwen}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{l|c|c|c|c|c|c|c|c|c}
+        \toprule
+        \textbf{压缩方式} & \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OpenBookQA} & \textbf{ARC-C} & \textbf{ARC-E} & \textbf{Winogrande} & \textbf{PIQA} & \textbf{CEval} & \textbf{Avg} \\
+        \midrule
+        完整模型  & 86.33  & 80.48  &  48.20 & 55.03 & 81.10 & 70.80 & 80.30 & 79.72 &  72.75\\
+        \midrule
+        SVD(50\%) &74.22  &  70.40 & 42.80  &  47.44 & 65.99 & 59.12 & 74.43  & 62.26 & 62.08\\
+        ASVD(50\%) &84.65   &75.29 & 45.60 & 50.00 & 68.82 &68.90  & 76.06 & 73.55 & 67.86\\
+        Palu(50\%) & 85.38 &  77.20 & 47.40 & 52.47 & 70.83 & 67.56 & 77.91 & 75.48 & 69.28 \\
+        \underline{Ours(50\%)} & \underline{86.02} & \underline{79.23}  &  \underline{47.00} & \underline{55.72}  & \underline{79.64}  &  \underline{69.77} & \underline{79.65}  & \underline{74.37} & \underline{71.43}  \\
+        \midrule
+        
+        \textbf{低秩+量化(25\%)} & \textbf{86.24}  & \textbf{80.21} & \textbf{48.20} & \textbf{57.34} & \textbf{80.72} & \textbf{70.32} & \textbf{79.65} & \textbf{78.45} &  \textbf{72.64} \\
+        \bottomrule
+    \end{tabular}}
+\end{table}
+\fi
+
+\textbf{长文本推理任务：} \space 表 \ref{tab:longbench-score} 在 LongBench 长文本场景下评估了压缩 KV 缓存后模型的长上下文能力。我们在LongBench的6个大类21个不同子任务上进行了实验，并将同一类的任务效果取平均展示在表中，并且由于直接的SVD在本就对KV质量要求较高的长文本场景下精度损失过大，因此只与ASVD和Palu进行了对比。可以看到，长文本任务对 KV 表征质量更敏感：在 50\% 压缩率下，ASVD 与 Palu 在两模型上的平均分均出现明显下降（例如 Llama 从 49.64 降至 43.10/45.42，Qwen 从 49.06 降至 41.90/43.05），其中 Multi-doc QA 与 Code 两类依赖跨段检索与长程依赖的任务退化比较显著，说明低秩近似误差在长上下文累积后更容易影响关键信息的检索与利用。相比之下，我们的注意力感知的低秩特征压缩方法在两模型上均能显著缩小与完整模型的差距（Llama Avg 46.28，Qwen Avg 44.78），并在 Multi-doc QA、Synthetic 等任务上保持更高得分，在长序列下压缩得到的KV 表征有更好的稳定性。进一步地，在对Value应用了低秩感知的量化压缩后，模型在50\%压缩率下能取得接近完整模型的整体表现（Llama Avg 47.68，Qwen Avg 47.73），并在 Code 任务上相较纯低秩压缩方案提升明显（如 Llama：53.30 vs. 47.09；Qwen：61.54 vs. 51.56），说明对Value尾部奇异值使用低精度存储而非直接丢弃的方式能够在不显著牺牲长上下文能力的前提下降低 KV 缓存开销，在长文本推理中更能体现优势。
+
+\begin{table}[htbp]
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+    \caption{LongBench 长文本任务上的得分（$\uparrow$）：括号内为压缩率，最优的效果用粗体表示，次优的效果用下划线表示。}
+    \label{tab:longbench-score}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{ll|c|c|c|c|c|c|c}
+        \toprule
+        \textbf{模型} & \textbf{压缩方式} & \textbf{Multi-doc QA} & \textbf{Single-doc QA} & \textbf{Summarization} & \textbf{Few shot} & \textbf{Synthetic} & \textbf{Code} & \textbf{Avg} \\
+        \midrule
+        \multirow{5}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 完整模型 & 42.09 & 47.54 & 26.28 & 63.58 & 68.15 & 60.03 & 49.64 \\
+            \cmidrule(lr){2-9}
+            & ASVD(50\%) & 33.42 & 40.96 & 24.05 & 60.50 & 61.17 & 44.67 & 43.10 \\
+            & Palu(50\%) & 37.27 & \underline{45.77} & 24.85 & 60.92 & 61.80 & 46.73 & 45.42 \\
+            \cmidrule(lr){2-9}
+            & \textbf{注意力感知低秩压缩(50\%)} & \underline{37.55} & 45.72 & \underline{25.52} & \underline{62.24} & \textbf{67.24} & \underline{47.09} & \underline{46.28} \\
+            & \textbf{低秩感知量化压缩-V(50\%)} & \textbf{40.12} & \textbf{46.14} & \textbf{25.84} & \textbf{62.49} & \underline{65.43} & \textbf{53.30} & \textbf{47.68} \\
+            
+            %& \textbf{低秩+量化(25\%)} & \textbf{40.27} & \textbf{46.05} & \textbf{25.76} & \textbf{62.31} & \underline{64.64} & \textbf{53.44} & \textbf{47.54} \\
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.8pt]
+        \multirow{5}{*}{\shortstack{\textbf{Qwen2.5-7B}\\\textbf{-Instruct}}}
+            & 完整模型 & 41.03 & 46.97 & 23.87 & 62.70 & 68.17 & 63.69 & 49.06 \\
+            \cmidrule(lr){2-9}
+            & ASVD(50\%) & 34.85 & 38.17 & 22.51 & 59.05 & 56.33 & 46.31 & 41.90 \\
+            & Palu(50\%) & 36.38 & 39.77 & \textbf{24.08} & 59.23 & 57.17 & 46.81 & 43.05 \\
+             \cmidrule(lr){2-9}
+            & \textbf{注意力感知低秩压缩(50\%)} & \underline{37.48} & \underline{41.89} & 22.91 & \underline{60.01} & \underline{62.67} & \underline{51.56} & \underline{44.78} \\
+            & \textbf{低秩感知量化压缩-V(50\%)} & \textbf{40.87} & \textbf{43.94} & \textbf{23.64} & \textbf{62.89}  & \textbf{64.67} & \textbf{61.54} & \textbf{47.73} \\
+           
+            %& \textbf{低秩+量化(25\%)} & \textbf{40.25} & \textbf{44.92} & \underline{23.57} & \textbf{62.74} & \textbf{64.33} & \textbf{62.25} & \textbf{47.78} \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{括号内为压缩率，效果最优的用粗体表示，次优的用下划线表示}
+\end{table}
+
+
+
+\iffalse
+\begin{table}[htbp]
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+        \caption{Llama3.1-8B-Instruct 在LongBech长文本任务上的得分($\uparrow$)}
+    %\label{tab:zeroshot-acc}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{l|c|c|c|c|c|c|c|}
+        \toprule
+        \textbf{压缩方式} & \textbf{Multi-doc QA	} & \textbf{Single-doc QA	} & \textbf{Summarization} & \textbf{Few shot} & \textbf{Synthetic} & \textbf{Code} & \textbf{Avg} \\
+        \midrule
+        完整模型  & 42.09  & 47.54 & 26.28  &  63.58 & 68.15& 60.03 & 49.64 \\
+        \midrule
+        ASVD(50\%) & 33.42  &   40.96 & 24.05 &60.50  & 61.17 &44.67 & 43.10 \\
+        Palu(50\%) & 35.06 &  42.39 & 24.19 & 61.65 & 61.83 & 46.15 & 44.35 \\
+        \underline{Ours(50\%)} & \underline{37.55} & \underline{45.72}  &  \underline{25.52} & \underline{62.24}  & \underline{67.24}  &  \underline{47.09} & \underline{46.28} \\
+        \midrule
+        \textbf{低秩+量化(25\%)} & \textbf{40.27}  & \textbf{46.05} & \textbf{25.76 } & \textbf{62.31} & \textbf{64.64} & \textbf{53.44} &  \textbf{47.54} \\
+        \bottomrule
+    \end{tabular}}
+\end{table}
+
+\begin{table}[htbp]
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+        \caption{Qwen2.5-7B-Instruct 在LongBech长文本任务上的得分}
+    %\label{tab:zeroshot-acc}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{l|c|c|c|c|c|c|c|}
+        \toprule
+        \textbf{压缩方式} & \textbf{Multi-doc QA	} & \textbf{Single-doc QA	} & \textbf{Summarization} & \textbf{Few shot} & \textbf{Synthetic} & \textbf{Code} & \textbf{Avg} \\
+        \midrule
+        完整模型  &41.03   & 46.97 & 23.87  &  62.70 & 68.17& 63.69 & 49.06 \\
+        \midrule
+        ASVD(50\%) & 34.85  & 38.17   & 22.51 &  59.05 & 56.33 & 46.31 & 41.90 \\
+        Palu(50\%) & 35.38 & 38.77  & 24.08 & 58.23 & 55.17 & 45.81 & 42.05  \\
+        \underline{Ours(50\%)} & \underline{37.48} & \underline{41.89}  &  \underline{22.91} & \underline{60.01}  & \underline{62.67}  &  \underline{51.56} & \underline{44.78} \\
+        \midrule
+        \textbf{低秩+量化(25\%)} & \textbf{40.25}  & \textbf{44.92} & \textbf{23.57} & \textbf{62.74} & \textbf{64.33} & \textbf{62.25} &  \textbf{47.78} \\
+        \bottomrule
+    \end{tabular}}
+\end{table}
+\fi
+
+\textbf{低压缩率效果：}\space 为验证本文特征维压缩方法在不同压缩率下的泛化性，我们在较低的 30\% 压缩率下进行评估；更高压缩率由于将在低秩感知量化的实验部分进一步讨论。表~\ref{tab:ppl-acc-30} 与表~\ref{tab:longbench-30} 给出了 30\% 压缩与 50\% 压缩及原模型的对比结果，其中\textbf{加粗}表示同一指标最优。
+
+在语言建模困惑度（PPL）上，30\% 压缩基本接近无损：Llama 的 WikiText-2/PTB 仅由 7.21/12.33 增至 7.35/12.64，Qwen 由 7.46/13.42 增至 7.81/14.32；相较之下，50\% 压缩的退化更明显（如 Qwen 的 PTB 升至 16.25）。在零样本任务上，30\% 压缩在两模型上均未削弱下游能力，且平均准确率略优于原模型（Llama：68.84 vs.\ 68.77；Qwen：72.88 vs.\ 72.75），说明适度压缩可能带来轻微“去噪”效应。在 LongBench 长文本评测中（表~\ref{tab:longbench-30}），30\% 压缩同样更稳健：平均分相对原模型仅小幅下降（Llama：48.48 vs.\ 49.64；Qwen：48.18 vs.\ 49.06），并显著优于 50\% 压缩（Llama：46.28；Qwen：44.78），其中对长程依赖更敏感的 Code 类别差异更明显。总体而言，30\% 属于“轻量压缩”区间，可在基本不损失语言建模与长文本能力的前提下稳定部署。
+%\textbf{低压缩率效果} 为了进一步探索我们的特征维度压缩方法在不同压缩率下的泛化性，我们在较低的30\%压缩率下测试了效果。更高压缩率受限于KV缓存低秩性有限，在后面~\ref{}低秩感知的量化策略实验章节会进行讨论并展示效果。。
+%表~\ref{tab:ppl-acc-30} 与表~\ref{tab:longbench-30} 展示了本研究提出的 KV 低秩压缩策略在30\% 压缩率下的效果，并与 50\% 压缩率及原模型（0\% 压缩）对比。表中\textbf{加粗}表示在同一任务/指标上表现最优的设置。
+
+%从语言建模困惑度（PPL）看，30\% 压缩率处于接近无损的区间：在 Llama3.1-8B-Instruct 上，WikiText-2/PTB 的 PPL 仅从 7.21/12.33 上升到 7.35/12.64；在 Qwen2.5-7B-Instruct 上也仅从 7.46/13.42 上升到 7.81/14.32。与之对比，50\% 压缩率下两模型 PPL 上升则稍明显（例如 Qwen 的 PTB 从 13.42 增至 16.25），说明在更保守的压缩预算下，所保留的主子空间足以覆盖大部分语言建模所需信息，能够更稳定地维持基座模型的困惑度表现。
+
+%更值得注意的是，在零样本推理任务上，30\% 压缩率不仅保持了下游能力，甚至在多项任务上超过原模型：例如在 Llama 上，30\% 压缩的 BoolQ、OpenBookQA、ARC-C、Winogrande 以及平均准确率（Avg=68.84）均为该模型三种设置中的最优；在 Qwen 上，30\% 压缩在 BoolQ、HellaSwag、OpenBookQA、ARC-C、ARC-E 以及整体平均（Avg=72.88）上同样取得最佳。该现象表明，适度的低秩压缩在推理阶段引入了轻微的数值“去噪”效应，使注意力层中 KV 表征更集中于信息量更高的子空间，减少了冗余信息，从而在不牺牲语言建模能力的前提下，对零样本泛化产生正向影响。
+
+%在 LongBench 长文本场景下（表~\ref{tab:longbench-30}），30\% 压缩率同样呈现“轻量压缩更稳健”的趋势。以平均得分为例，Llama 在 30\% 压缩下为 48.48，仅比原模型 49.64 下降 1.16 分，并显著优于 50\% 压缩下的 46.28；Qwen 在 30\% 压缩下为 48.18，也明显优于 50\% 压缩下的 44.78。分项任务上，30\% 压缩对长程依赖更敏感的类别（例如 Multi-doc QA、Code）保持得更好：Llama 的 Code 从 60.03 仅降至 57.14，而 50\% 压缩会降至 47.09；Qwen 的 Code 在 30\% 压缩下几乎无损（63.23 vs.\ 63.69），但在 50\% 压缩下显著下降到 51.56。这说明在长上下文推理中，KV 近似误差更容易随序列增长而累积放大；因此，30\% 这类保守压缩更符合长文本部署对稳定性的要求。
+
+%综合来看，30\% 压缩率为“轻量压缩”场景：它在两类模型上同时实现了：（1）语言建模指标几乎不退化、（2）零样本下游能力不降反升、（3）长文本能力保持稳定。这进一步说明本文方法在低压缩率区间具有良好的鲁棒性与可用性。
+
+
+\begin{table}[htbp]
+    \centering
+    \caption{语言建模困惑度($\downarrow$) 与零样本 推理准确率($\uparrow$)：30\% 与 50\% 压缩率对比，最优的效果用粗体表示。}
+    \label{tab:ppl-acc-30}
+    \renewcommand{\arraystretch}{1.12}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llcc ccccccccc}
+        \toprule
+        \textbf{模型} & \textbf{方法} &
+        \multicolumn{2}{c}{\textbf{Perplexity} $\downarrow$} &
+        \multicolumn{9}{c}{\textbf{准确率} (\%) $\uparrow$} \\
+        \cmidrule(lr){3-4}\cmidrule(lr){5-13}
+        & & \textbf{WikiText-2} & \textbf{PTB} &
+        \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OpenBookQA} & \textbf{ARC-C} & \textbf{ARC-E} & \textbf{Winogrande} & \textbf{PIQA} & \textbf{CEval} & \textbf{Avg} \\
+        \midrule
+        \multirow{3}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 原模型 & 
+            \textbf{7.21} & \textbf{12.33} & 80.04 & \textbf{79.27} & 43.00  & 55.03 & \textbf{79.59} & 73.95 & \textbf{81.01} & \textbf{54.23} & 68.77 \\
+            & 压缩 50\% & 8.04 & 14.09 & 83.61 & 77.62 & 43.80 & 54.44 & 79.21 & 73.48 & 80.47 & 52.01 & 68.08 \\
+            & 压缩 30\% & 7.35  & 12.64 & \textbf{83.82}  & 78.94 & \textbf{44.20} & \textbf{55.55} & 79.55 & \textbf{74.35} & 80.74 & 53.57 & \textbf{68.84} \\
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.8pt]
+        \multirow{3}{*}{\shortstack{\textbf{Qwen2.5-7B}\\\textbf{-Instruct}}}
+            & 原模型 & \textbf{7.46} & \textbf{13.42} & 86.33 & 80.48 & 48.20  &55.03  & 81.10 & \textbf{70.80} & \textbf{80.30} & \textbf{79.72} & 72.75 \\
+            & 压缩 50\% &  8.62 & 16.25 & 86.02 & 79.23 & 47.00 & 55.72 & 79.64 & 69.77 & 79.65 & 74.37 & 71.43 \\
+            & 压缩 30\% & 7.81 & 14.32 & \textbf{86.76} & \textbf{80.49} & \textbf{49.60} & \textbf{56.40} & \textbf{81.69} & 70.64 & 79.11 &  78.38 &  \textbf{72.88}\\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{效果最优的用粗体表示}
+\end{table}
+
+\begin{table}[htbp]
+    \centering
+    \caption{LongBench 长文本任务得分($\uparrow$)：30\% 与 50\% 压缩率对比，最优的效果用粗体表示。}
+    \label{tab:longbench-30}
+    \renewcommand{\arraystretch}{1.12}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llccccccc}
+        \toprule
+        \textbf{模型} & \textbf{方法} &
+        \textbf{Multi-doc QA} & \textbf{Single-doc QA} & \textbf{Summarization} &
+        \textbf{Few shot} & \textbf{Synthetic} & \textbf{Code} & \textbf{Avg} \\
+        \midrule
+        \multirow{3}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 原模型  & \textbf{42.09} & 47.54 & \textbf{26.28} & \textbf{63.58} & \textbf{68.15} & \textbf{60.03} & \textbf{49.64}  \\
+            & 压缩 50\% & 37.55 & 45.72 & 25.52 & 62.24 & 67.24 & 47.09 & 46.28   \\
+            & 压缩 30\% & 39.89 & \textbf{47.82} & 25.77 & 62.83 &66.42  & 57.14 & 48.48 \\
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.8pt]
+        \multirow{3}{*}{\shortstack{\textbf{Qwen2.5-7B}\\\textbf{-Instruct}}}
+         & 原模型 & \textbf{41.03} & \textbf{46.97} & \textbf{23.87} & \textbf{62.70} & \textbf{68.17} & \textbf{63.69} & \textbf{49.06} \\
+            & 压缩 50\% & 37.48 & 41.89 & 22.91 & 60.01 & 62.67 & 51.56 & 44.78 \\
+            & 压缩 30\% & 40.10 & 45.58 & 23.34 & 62.08 & 67.00 & 63.23 & 48.18 \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{效果最优的用粗体表示}
+\end{table}
+
+%\subsection{低秩感知的量化方案}
+\textbf{更高压缩率的效果：}\space \textcolor{red}{}低秩感知的量化压缩方式不仅能够减少丢弃Value尾部奇异值带来的信息损失，表~\ref{tab:ppl-acc-quant-ablation-llama}和~\ref{tab:longbench-quant-ablation-llama}中的消融实验也证明了其相较于“低秩丢弃后应用量化”提供了一种模型精度损失更小的结合特征压缩和量化压缩的框架。通过低秩感知的量化方式将我们的注意力感知的低秩压缩算法与SOTA的量化方法结合，能够在更高的压缩率下保持模型的能力不退化。我们使用低秩感知的量化方式将我们的特征降维算法与KIVI量化结合，在75\%和87.5\%压缩率下与只使用量化技术路线的SOTA方法对比，以此证明我们的"低秩+量化"结合方式，相较于单独使用一种技术路线能够在高压缩率下更好地保留模型的效果。
+
+对于量化的基线方法：KIVI和KVQuant，通过4比特量化和2比特量化的方式使模型KV缓存的压缩率分别达到75\%和87.5\%，我们的方法则是在低秩感知的量化框架下通过使用80\%特征维压缩结合平均5比特混合精度量化和66\%特征维压缩+平均3比特混合精度量化实现75\%和87.5\%的KV压缩率。结果如表~\ref{tab:longbench-kv-cache-compress-compare} 与表~\ref{tab:zeroshot-score-quant} 所示，在 75\% 与 87.5\% 两档较高压缩率下，我们的“特征压缩 + 低秩感知混合精度量化”在两种模型、两类评测（LongBench 长文本与零样本推理任务）中均表现出更好的整体稳健性。
+
+在Longbench长文本测评集上，对于 Llama3.1-8B-Instruct，75\% 压缩时我们取得最高平均分（48.81），优于 KIVI（48.47）与 KVQuant（48.20），且相对完整模型仅下降 0.83 分；当压缩率进一步提升到 87.5\% 时，我们仍保持最高平均分（47.34），继续领先 KIVI（47.13）与 KVQuant（46.94）。在 Qwen2.5-7B-Instruct 上，这一趋势更为明显：75\% 压缩下我们几乎无损（48.96 vs.\ 49.06），并且在各基线中最佳；87.5\% 压缩下我们同样取得最高平均分（47.48），显著优于 KIVI（46.85）与 KVQuant（46.19）。总体而言，在高压缩率场景中，纯量化路线（KIVI/KVQuant）在长文本任务上出现了更多的能力退化，而我们的低秩感知量化通过“头部高精度、尾部低精度”的分配方式，缓解了 Value 尾部信息被过度损伤导致的长程推理能力下降，从而在平均指标上更稳定。
+
+在零样本推理任务上，表~\ref{tab:zeroshot-score-quant} 显示，在更高压缩率下我们对零样本推理能力的保持同样更好。以平均准确率为例，Llama 在 75\%/87.5\% 压缩下分别为 68.78/68.79，基本与完整模型（68.77）一致并在同档压缩率中最优；Qwen 在 75\% 压缩下与完整模型持平（72.75），在 87.5\% 下也仅轻微下降至 72.73，同时仍优于两种量化基线。该结果进一步说明：在统一压缩预算下，简单地提高整体量化强度会带来更明显的能力损失；而低秩感知的混合精度量化能够在不改变总体压缩率的前提下更有效地分配误差，使模型在高压缩率下仍相比原模型保持几乎无损的零样本泛化能力。
+
+综上，以上实验从长文本与零样本两方面验证了本研究提出的低秩感知混合精度量化方法在高压缩率下的优势：相较于单独使用量化技术路线，我们的方法能在 75\% 乃至 87.5\% 的 KV 压缩率下更好地保留模型能力，并体现出更稳定的跨任务表现。这充分说明了结合了“量化+低秩”的低秩感知量化压缩方式充分利用了Key和Value各自低秩性带来的特征维度压缩潜力以及量化压缩自身的优点，以实现了比单一依赖量化或特征压缩更低的精度损失。
+
+% \usepackage{booktabs,multirow}
+\begin{table}[htbp]
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+    \caption{75\%/87.5\% 高压缩率下LongBench 不同任务类型上的得分（$\uparrow$）：括号内为压缩率，最优的效果用粗体表示。}%，对比 KIVI、KVQuant 与本文方法在 75\%/87.5\% KV 缓存较高压缩率下的表现
+    \label{tab:longbench-kv-cache-compress-compare}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{ll|c|c|c|c|c|c|c}
+        \toprule
+        \textbf{模型} & \textbf{方法(压缩率)} & \textbf{Multi-doc QA} & \textbf{Single-doc QA} & \textbf{Summarization} & \textbf{Few shot} & \textbf{Synthetic} & \textbf{Code} & \textbf{Avg} \\
+        \midrule
+        \multirow{7}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 完整模型  & 42.09 & 47.54 & 26.28 & 63.58 & 68.15 & 60.03 & 49.64  \\
+            \cmidrule(lr){2-9}
+            & KIVI(75\%)      & \textbf{41.18} & 46.65 & 25.86 & \textbf{63.40} & 65.26 & \textbf{57.92} & 48.47 \\
+            & KVQuant(75\%)   & 41.06 & 47.18 & \textbf{26.16} & 62.62 & 65.79 & 53.37 & 48.20 \\
+            & \textbf{Ours(75\%)}     & 41.00 & \textbf{47.57} & 26.02 & 62.94 & \textbf{67.04} & 56.84 & \textbf{48.81} \\
+            \cmidrule(lr){2-9}
+            & KIVI(87.5\%)    & \textbf{39.89} & 44.70 & 25.27 & 61.83 & 63.41 & 
+            \textbf{56.33} & 47.13 \\
+            & KVQuant(87.5\%) & 38.85 & 45.24 & \textbf{25.94} & 60.30 & \textbf{65.29} & 54.29 & 46.94 \\
+            & \textbf{Ours(87.5\%)}   & 37.95 &\textbf{46.35} & 25.73 & \textbf{65.52} & 64.59 & 55.05 & \textbf{47.34} \\
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.8pt]
+        \multirow{7}{*}{\shortstack{\textbf{Qwen2.5-7B}\\\textbf{-Instruct}}}
+            & 完整模型  & 41.03 & 46.97 & 23.87 & 62.70 & 68.17 & 63.69 & 49.06 \\
+            \cmidrule(lr){2-9}
+            & KIVI(75\%) & 40.69 & 46.42 & 23.78 & 60.25 & 67.50 & \textbf{62.24} & 48.17 \\
+            & KVQuant(75\%)   &40.84  & 46.33 & \textbf{23.86} & 62.12 & 67.17 & 61.28 & 48.41 \\
+            & \textbf{Ours(75\%)} & \textbf{41.56} & \textbf{46.63} & 23.69 & \textbf{63.10} & \textbf{68.00} & 62.19 & \textbf{48.96} \\
+            \cmidrule(lr){2-9}
+            & KIVI(87.5\%)    & 37.21 & 44.27 & \textbf{23.82} & 60.25 & \textbf{65.33} & 62.79 & 46.85 \\
+            & KVQuant(87.5\%) & 37.38 &43.90 & 23.19 & 60.73 & 62.67 & 60.60 & 46.19 \\
+            & \textbf{Ours(87.5\%)}  & \textbf{37.79} & \textbf{45.17} & 23.51 & \textbf{62.10} & \textbf{65.33} & \textbf{63.35} & \textbf{47.48} \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{括号内为压缩率，效果最优的用粗体表示}
+\end{table}
+
+% \usepackage{booktabs,multirow}
+\begin{table}[htbp]
+    \centering
+    \renewcommand{\arraystretch}{1.1}
+    \caption{ 75\%/87.5\% 高压缩率下零样本推理任务上的得分（$\uparrow$）：括号内为压缩率，最优的效果用粗体表示。}
+    \label{tab:zeroshot-score-quant}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{ll|c|c|c|c|c|c|c|c|c}
+        \toprule
+        \textbf{模型} & \textbf{压缩方式} &
+        \textbf{boolq} & \textbf{hellaswag} & \textbf{openbookqa} &
+        \textbf{arc\_challenge} & \textbf{arc\_easy} &
+        \textbf{winogrande} & \textbf{piqa} & \textbf{ceval-valid} & \textbf{Avg} \\
+        \midrule
+        \multirow{5}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 完整模型  & 84.04  & 79.27  &  43.00 &55.03& 79.59 & 73.95 & 81.01 & 54.23 &  68.77 \\
+            \cmidrule(lr){2-11}
+            & KIVI(75\%)    & \textbf{84.22} & 78.94 & 42.80 & 54.78 & 78.96 & \textbf{74.27} & 80.52 & 53.34 & 68.48 \\
+            & KVQuant(75\%) & 83.85 & 78.91 & 42.60 & 53.84 &78.96 & 73.56 & \textbf{81.07} & 53.86 & 68.33 \\
+            \cmidrule(lr){2-11}
+            & \textbf{Ours(75\%)} & 84.01 & \textbf{79.29} & \textbf{43.20} & \textbf{55.12} & \textbf{79.71} & 74.11 &80.85 & \textbf{53.94} & \textbf{68.78} \\
+            \addlinespace[2.0pt]
+            \cmidrule(lr){2-11}
+            & KIVI(87.5\%)    & 83.18 & 78.07 & \textbf{43.80} & 53.16 & 78.47 & 72.77 & 79.84 & 52.49 & 67.72 \\
+            & KVQuant(87.5\%) &83.98 & 78.54 & 43.60 &54.10 & 78.91 &73.88 & 80.74 & 52.67 & 68.30 \\
+            \cmidrule(lr){2-11}
+            & \textbf{Ours(87.5\%)} & \textbf{84.07} & \textbf{79.17}
+ & 43.20 & \textbf{55.38} & \textbf{79.76} & \textbf{74.27} & \textbf{80.79} & \textbf{53.64} & \textbf{68.79} \\
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.2pt]
+        \specialrule{0.6pt}{0pt}{0pt}
+        \addlinespace[1.8pt]
+        \multirow{5}{*}{\shortstack{\textbf{Qwen2.5-7B}\\\textbf{-Instruct}}}
+            & 完整模型 & 86.33  & 80.48  &  48.20 & 55.03 & 81.10 & 70.80 & 80.30 & 79.72 &  72.75 \\
+            \cmidrule(lr){2-11}
+            & KIVI(75\%)    & 83.46 & 80.37 & 48.80 &54.44 & 80.30 &  69.46 & 79.60 & 77.71 & 71.77 \\
+            & KVQuant(75\%) &85.87 & 79.92 &46.80 &  \textbf{54.86} & 78.79  & 69.06 &79.38 & 79.05 & 71.72 \\
+            \cmidrule(lr){2-11}
+            & \textbf{Ours(75\%)} & \textbf{86.36} & \textbf{80.61} & \textbf{49.20} & 54.69 & \textbf{80.85} & \textbf{70.09} & \textbf{80.03} & \textbf{80.16} & \textbf{72.75} \\
+            \addlinespace[2.0pt]
+            \cmidrule(lr){2-11}
+            & KIVI(87.5\%)    & 85.78  & 79.74 & \textbf{49.40} & 53.62 &78.03 &  68.64 & 77.26 & 77.41 & 71.24 \\
+            & KVQuant(87.5\%) & 86.36 &80.37 & 47.80 &54.95 &  80.43 & \textbf{70.88} & \textbf{79.38} & \textbf{79.79} & 72.49 \\
+            \cmidrule(lr){2-11}
+            & \textbf{Ours(87.5\%)} & \textbf{86.45} & \textbf{80.48} & 48.60 & \textbf{55.55} & \textbf{81.65} & 70.48 & 79.22 & 79.42 & \textbf{72.73} \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{括号内为压缩率，效果最优的用粗体表示}
+\end{table}
+
+
+
+%为了在高的压缩率下减少模型的精度损失，我们提出了低秩感知的量化方案，给出了一种结合我们的KV缓存特征降维方案和量化技术路线的创新方法。为了与量化压缩KV的方法公平对比，我们利用低秩感知的量化方法将SOTA的低精度量化方法KIVI与我们的特征降维压缩KV方法结合，来与只使用量化技术路线的SOTA方法对比，以此证明通过我们的"低秩+量化"结合方式，相较于单独使用一种技术路线能够在很高压缩率（75\%，87.5\%）下更好地保留模型的效果。
+
+% \usepackage{booktabs,multirow}
+
+
+
+\subsection{显存占用}
+为了直观展现本研究所提方法的KV缓存压缩作用，我们在L20显卡上分别测试了16K，32K，48K，64K，80K，96K，112K和128K
+的长文本推理过程中，原模型和使用我们的“注意力感知低秩特征压缩+低秩感知的量化压缩”后KV压缩率处于87.5\%的模型推理时的显存占用峰值和KV缓存的显存占用。表~\ref{tab:memory_peak_kv_by_seqlen}展示了不同输入长度下的显存情况，原模型支持的最长输入仅有64K，当输入序列达到80K时原模型已经出现OOM，无法再继续推理；而使用本研究所提的KV压缩方式压缩后的模型能够在112K的超长文本下维持模型的正常推理过程，并且在128K的输入长度下理论上的显存占用峰值也只略微超过了L20的显存大小。图~\ref{fig:two_plots}更直观的展示了压缩前后模型推理的显存峰值和KV显存占用情况，其中出现OOM后的显存占用为理论估计，用虚线表示。实验结果充分展现了在显存资源受限的场景下，本研究所提的KV压缩算法能够大幅提高模型推理所支持的输入文本长度上限，并且表~\ref{tab:longbench-kv-cache-compress-compare}和~\ref{tab:zeroshot-score-quant}中的实验结果也表明在通过高压缩率大幅提升模型能够处理的文本长度上限的同时模型精度也不会有大的损失。
+
+% \usepackage{booktabs,multirow}
+\begin{table}[htbp]
+\centering
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{4pt}
+\caption{不同序列长度下的显存峰值与 KV 缓存显存占用（单位为 GB）}
+\label{tab:memory_peak_kv_by_seqlen}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l|cc|cc|cc|cc|cc|cc|cc|cc}
+\toprule
+\multirow{2}{*}{} &
+\multicolumn{2}{c|}{\textbf{16k}} &
+\multicolumn{2}{c|}{\textbf{32k}} &
+\multicolumn{2}{c|}{\textbf{48k}} &
+\multicolumn{2}{c|}{\textbf{64k}} &
+\multicolumn{2}{c|}{\textbf{80k}} &
+\multicolumn{2}{c|}{\textbf{96k}} &
+\multicolumn{2}{c|}{\textbf{112k}} &
+\multicolumn{2}{c}{\textbf{128k}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}\cmidrule(lr){12-13}\cmidrule(lr){14-15}\cmidrule(lr){16-17}
+& 峰值显存 & KV显存 & 峰值显存 & KV显存 & 峰值显存 & KV显存 & 峰值显存 & KV显存 & 峰值显存 & KV显存 & 峰值显存 & KV显存 & 峰值显存 & KV显存 & 峰值显存 & KV显存 \\
+\midrule
+Full model & 21.00 & 2.01  & 27.04 & 4.00     & 33.08 & 6.00 & 39.12  & 8.00 & OOM & OOM & OOM & OOM & OOM & OOM & OOM & OOM \\
+Our method & 18.84 & 0.26  & 23.13 & 0.50 & 27.41 & 0.75 & 31.70 & 1.00  & 35.99 & 1.25  & 40.28 & 1.50  & 44.57 & 1.76 & OOM  & OOM \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.49\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/peak_memory_kv_vs_length.png}
+    \caption{显存占用峰值}
+    \label{fig:a}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.49\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{figures/kvcache_memory_kv_vs_length.png}
+    \caption{KV显存占用}
+    \label{fig:b}
+  \end{subfigure}
+  \caption{显存占用随序列长度变化情况，虚线表示OOM后理论估计的数值}
+  \label{fig:two_plots}
+\end{figure}
+
+\iffalse
+\subsection{算法效率}
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=1\linewidth]{figures/prefilling_throughput_vs_length.png}
+    \caption{预填充阶段吞吐率对比}
+    \label{fig:kv_cache}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=1\linewidth]{figures/decoding_throughput_vs_length.png}
+    \caption{解码阶段吞吐率对比}
+    \label{fig:kv_cache}
+\end{figure}
+\fi
+
+\subsection{消融实验}
+本小节主要聚焦于实验验证本研究提出的注意力-激活感知的低秩KV缓存压缩策略和低秩感知的混合精度量化算法中各个模块的作用和相比之前方法带来的提升。对于注意力-激活感知的低秩KV缓存压缩策略，我们将此前的SOTA方法Palu的SVD分解方案、层间秩分配方案与我们的SVD分解方案、层间秩分配方案对比，来实验验证我们设计的注意力-激活值感知的SVD分解方式和基于当前整体秩配置下评估各层重要性并迭代重分配算法相较于此前方法带来的提升；对于低秩感知的混合精度量化算法，我们将与此前的"低秩裁剪后量化"对比，在同等压缩率下证明我们的方案能保留完整模型更多的能力，是一种更好的将的特征维度压缩和量化压缩结合的框架；我们还与对完整不分解的Value直接量化在同等压缩率下进行了对比，来说明低秩感知的混合精度量化的优势；为了验证~\ref{sec:quant_accelarate}小节中所提的通过量化Value缓存和重建矩阵$Q$来使用低精度矩阵乘法加速Value缓存的重建不会带来大的精度损失，我们也对比了我们的算法中将$Q$是否进行量化带来的模型精度区别。
+
+\textbf{低秩KV缓存特征压缩算法的消融实验：} \space 表~\ref{tab:ppl-acc-ablation-llama}和表~\ref{tab:longbench-ablation-llama}分别代表在整体50\%的KV压缩率下，Palu/我们的SVD低秩近似方式，Palu/我们的秩分配方式相互组合的效果。从表~\ref{tab:ppl-acc-ablation-llama} 可以观察到，在固定总体 KV 压缩率为 50\% 的前提下，SVD 分解策略与层间秩分配策略对最终表现的贡献具有互补性。以 Palu 的完整方案（palu-svd+palu-rank）作为基线，其在 WikiText-2/PTB 上的困惑度为 8.94/15.27，零样本平均准确率为 67.67。首先，仅替换为我们的层间秩分配（palu-svd+our-rank）即可在语言建模上带来稳定增益：困惑度分别下降到 8.39/14.08（PTB 上为四种组合中最低），并在零样本任务上带来小幅提升（Avg 从 67.67 升至 67.77）。这说明我们提出的“在当前整体秩配置下评估各层重要性并迭代重分配”的策略，相比 Palu 的分配方式能更有效地把有限秩预算分配给更敏感/更关键的层的KV，从而降低分解误差和整体误差累积对模型精度的影响。与此同时，仅替换为我们的 SVD 分解（our-svd+palu-rank）在零样本任务上的收益更为显著：Avg 提升到 68.28（四种组合中最高），并在 ARC-E（80.81）与 CEval（52.42）等任务上取得最优，表明注意力--激活感知的分解目标更贴近推理时的真实计算路径，能够在相同压缩率下更好地保留对下游推理至关重要的信息。进一步地，当两者同时使用（our-svd+our-rank）时，语言建模与零样本任务整体达到更均衡的最优折中：WikiText-2 的 困惑度达到四者最低（8.04），并在 BoolQ 与 ARC-C 等任务上取得最优或接近最优，说明两模块叠加能够同时改善“生成式建模能力”（困惑度）与“判别式推理能力”（准确率），验证了我们方法的端到端有效性。表~\ref{tab:longbench-ablation-llama} 则从长上下文场景进一步刻画了上述结论。与 palu-svd+palu-rank（Avg=44.35）相比，替换为我们的秩分配（palu-svd+our-rank）能将平均分提升到 45.96，并且在 Code 上带来显著提升（46.15 $\rightarrow$ 56.22），说明在长文本推理中，合理的层间秩预算分配对 KV 缓存尤为关键：若关键层被过度压缩，误差会随序列长度增长而累积放大，最终表现为代码生成/长程依赖任务的明显退化。另一方面，替换为我们的 SVD 分解（our-svd+palu-rank）在 Multi-doc QA 与 Single-doc QA 上取得最优（37.60/45.78），并显著提升 Synthetic（67.33），反映注意力--激活感知的低秩子空间更有利于跨段检索与信息整合等长程能力；但该组合在 Code 上下降较多（40.56），也提示：若缺少匹配的层间秩分配策略，单纯改进分解目标仍可能在某些高度依赖特定层/特定通道的信息处理中出现不合适的秩分配导致性能下降。最终，our-svd+our-rank 在 Avg 上达到四种组合的最优（46.28），并在 Summarization 与 Few shot 上取得最优（25.52/62.24），同时在 Multi-doc QA、Single-doc QA 上保持接近最优的水平，说明两模块结合能够在长上下文场景下实现更稳健的整体收益：一方面通过更贴近推理目标的分解减少注意力输出的近似误差，另一方面通过迭代式秩重分配抑制误差在深层与长序列中的累积放大。
+
+\begin{table}[htbp]
+    \centering
+    \caption{困惑度($\downarrow$) 与 零样本推理 准确率($\uparrow$) 的 SVD/Rank 组合消融：“palu/our-svd”表示分解策略，“palu/our-rank”表示秩分配策略，最优效果用粗体表示。}
+    \label{tab:ppl-acc-ablation-llama}
+    \renewcommand{\arraystretch}{1.12}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llcc ccccccccc}
+        \toprule
+        \textbf{模型} & \textbf{方法} &
+        \multicolumn{2}{c}{\textbf{Perplexity} $\downarrow$} &
+        \multicolumn{9}{c}{\textbf{准确率} (\%) $\uparrow$} \\
+        \cmidrule(lr){3-4}\cmidrule(lr){5-13}
+        & & \textbf{WikiText-2} & \textbf{PTB} &
+        \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OpenBookQA} & \textbf{ARC-C} & \textbf{ARC-E} & \textbf{Winogrande} & \textbf{PIQA} & \textbf{CEval} & \textbf{Avg} \\
+        \midrule
+        \multirow{4}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & palu-svd+palu-rank & 8.94 & 15.27 & 80.95 & 76.88 & \textbf{45.60} & 54.24 & 78.82 &73.88  & \textbf{80.54} & 50.47 & 67.67 \\
+            & palu-svd+our-rank  & 8.39 & \textbf{14.08} & 83.12 & \textbf{77.94} & 43.80 & 53.67 & 77.57 & \textbf{74.82} & 80.47 &  50.74 & 67.77 \\
+            & our-svd+palu-rank &  8.30 & 14.48 & 83.25 & 77.77 &  43.80 & 54.27 & \textbf{80.81} & 73.95 & 79.98 & \textbf{52.42} & \textbf{68.28}  \\
+            & our-svd+our-rank   & \textbf{8.04} & 14.09 & \textbf{83.61} & 77.62 & 43.80 & \textbf{54.44} & 79.21 & 73.48 & 80.47 & 52.01 & 68.08 \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{“palu/our-svd”表示分解策略，“palu/our-rank”表示秩分配策略，最优效果用粗体表示}
+\end{table}
+
+
+\begin{table}[htbp]
+    \centering
+    \caption{LongBench 得分（$\uparrow$）的 SVD/Rank 组合消融：“palu/our-svd”表示分解策略，“palu/our-rank”表示秩分配策略，最优效果用粗体表示。}
+    \label{tab:longbench-ablation-llama}
+    \renewcommand{\arraystretch}{1.12}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llccccccc}
+        \toprule
+        \textbf{模型} & \textbf{方法} &
+        \textbf{Multi-doc QA} & \textbf{Single-doc QA} & \textbf{Summarization} &
+        \textbf{Few shot} & \textbf{Synthetic} & \textbf{Code} & \textbf{Avg} \\
+        \midrule
+        \multirow{4}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & palu-svd+palu-rank & 37.27 & 45.77 &24.85  & 60.92 & 61.80 & 46.73 & 45.42 \\
+            & palu-svd+our-rank  & 37.25 & 44.13 & 24.49 & 61.47 & 61.17 & \textbf{56.22} & 45.96  \\
+            & our-svd+palu-rank  & \textbf{37.60}  & \textbf{45.78} & 25.34 & 61.70 & \textbf{67.33} & 40.56 & 45.94 \\
+            & our-svd+our-rank & 37.55  &  45.72 & \textbf{25.52} & \textbf{62.24} & 67.24 & 47.09&  \textbf{46.28}  \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{“palu/our-svd”表示分解策略，“palu/our-rank”表示秩分配策略，最优效果用粗体表示}
+\end{table}
+
+\textbf{低秩感知的混合精度量化算法的消融实验：} \space 为验证本研究提出的“低秩感知混合精度量化”的有效性，我们进行了两组实验。第一组实验是为了验证其相较于“丢弃尾部奇异值后量化”这种结合方式的优势，以及验证量化重建矩阵$Q$来加速是否会对算法精度产生影响，在固定 KV 缓存总体压缩预算下，对三种量化策略进行对比：(i) \textbf{低秩后量化}（先进行 50\% 低秩裁剪，再对保留下来的低维缓存统一做 8比特 量化以进一步压缩）；(ii) \textbf{低秩感知量化+量化$Q$}（对 Value 侧不再丢弃秩，而是依据秩重要性对头部秩使用较高精度、尾部秩使用较低精度，从而在相同比特位宽预算下尽量保留长尾信息）；(iii) \textbf{低秩感知量化+全精度$Q$}（在 (ii) 基础上不量化重建矩阵 $Q$，用于评估量化 $Q$ 带来的额外影响）。表~\ref{tab:ppl-acc-quant-ablation-llama} 与表~\ref{tab:longbench-quant-ablation-llama} 分别给出了语言建模/零样本推理与 LongBench 长文本任务的结果。
+
+%\paragraph{低秩感知量化优于“低秩后量化”：保留 Value 长尾信息更关键。}
+从表~\ref{tab:ppl-acc-quant-ablation-llama} 可以看到，将“低秩后量化”替换为我们的“低秩感知量化”后，语言建模困惑度显著改善：WikiText-2/PTB 的 困惑度从 8.04/14.13 降至 7.56/12.83，说明在相同总体压缩预算下，仅对裁剪维度后的低秩表示统一量化会造成较大的信息损失；而我们的策略通过对 Value 的秩重要性进行区分，对重要秩维持较高精度、对不重要秩采用较低精度但不直接丢弃，有效缓解了 Value 侧“低秩性不够强、直接裁剪会误删有用信息”的问题。该趋势同样体现在零样本推理任务上：平均准确率从 67.91 提升到 68.51，并在 BoolQ、HellaSwag、Winogrande、CEval 等多项任务上取得一致提升，表明保留 Value 长尾信息能够更好地维持（甚至提升）模型在多任务上的泛化能力。在长文本场景下（表~\ref{tab:longbench-quant-ablation-llama}），低秩感知量化同样带来更稳健的整体收益：平均分从 46.61 提升到 47.54，且在 Multi-doc QA 与 Single-doc QA 上提升尤为明显（36.82$\rightarrow$40.27，44.91$\rightarrow$46.05）。这说明长上下文推理对 KV 表征质量更敏感，特别是跨段检索与信息整合更依赖 Value 中的细粒度信息；因此，相比“先低秩裁剪再统一量化”，在不丢弃秩的前提下做低秩感知的混合精度分配更能抵御误差在长序列上的累积放大，从而提升长文本任务的整体表现。
+
+%\paragraph{量化重建矩阵 $Q$ 的额外精度损失很小，换取更高效率。}
+进一步地，我们的提高推理时在线重建效率的可能方案中，在“低秩感知量化”后也对重建矩阵 $Q$ 进行量化。由表~\ref{tab:ppl-acc-quant-ablation-llama} 可见，“低秩感知量化+量化 $Q$”与“低秩感知量化+全精度$Q$”在语言建模 困惑度上几乎一致（WikiText-2 相同为 7.56，PTB 仅 12.83 vs.\ 12.84 的微小差异），而零样本平均准确率仅有小幅差距（68.51 vs.\ 68.75）。这表明，对 $Q$ 的量化不会引入明显的额外误差，整体精度损失可控。在 LongBench 上，两者的平均得分也非常接近（47.54 vs.\ 47.78），说明对长文本能力的影响同样有限。综合上述结果可得：我们的低秩感知量化是提升压缩后精度的关键因素；在此基础上进一步量化 $Q$ 能在几乎不牺牲精度的前提下带来更好的推理效率与存储收益，因此在硬件支持快速低精度矩阵乘法的情况下是一个具有工程价值的增强模块。
+
+\begin{table}[htbp]
+    \centering
+    \caption{低秩感知量化（是否量化$Q$）v.s.低秩后量化：困惑度($\downarrow$) 与零样本推理准确率($\uparrow$)：最优效果用粗体表示。 }
+    \label{tab:ppl-acc-quant-ablation-llama}
+    \renewcommand{\arraystretch}{1.12}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llcc ccccccccc}
+        \toprule
+        \textbf{模型} & \textbf{方法} &
+        \multicolumn{2}{c}{\textbf{Perplexity} $\downarrow$} &
+        \multicolumn{9}{c}{\textbf{准确率} (\%) $\uparrow$} \\
+        \cmidrule(lr){3-4}\cmidrule(lr){5-13}
+        & & \textbf{WikiText-2} & \textbf{PTB} &
+        \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OpenBookQA} & \textbf{ARC-C} & \textbf{ARC-E} & \textbf{Winogrande} & \textbf{PIQA} & \textbf{CEval} & \textbf{Avg} \\
+        \midrule
+        \multirow{3}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 低秩后量化 & 8.04 & 14.13 & 83.64 & 77.60 & 43.80 & 54.27 & 79.12 &  73.01 & 80.36 & 51.49 &  67.91 \\
+            & 低秩感知量化+量化$Q$ & \textbf{7.56} & \textbf{12.83} & 84.13 & 78.72 & 43.20 &  54.61& \textbf{80.01} & \textbf{74.66} & 80.63 & 52.08 &  68.51   \\
+            & 低秩感知量化+全精度$Q$ & \textbf{7.56} & 12.84 & \textbf{84.28}  & \textbf{78.82}  & \textbf{44.00}  & \textbf{54.95} & \textbf{80.01} &  73.95 & \textbf{81.01}  & \textbf{52.97} & \textbf{68.75}  \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{对比不同量化策略在相同 KV 压缩预算下对语言建模（PPL）与零样本推理（Accuracy）的影响。}
+    %\caption*{最优效果用粗体表示}
+\end{table}
+
+\begin{table}[htbp]
+    \centering
+    \caption{低秩感知量化（是否量化$Q$）v.s.低秩后量化：LongBench 得分($\uparrow$)：最优效果用粗体表示。}
+    \label{tab:longbench-quant-ablation-llama}
+    \renewcommand{\arraystretch}{1.12}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llccccccc}
+        \toprule
+        \textbf{模型} & \textbf{方法} &
+        \textbf{Multi-doc QA} & \textbf{Single-doc QA} & \textbf{Summarization} &
+        \textbf{Few shot} & \textbf{Synthetic} & \textbf{Code} & \textbf{Avg} \\
+        \midrule
+        \multirow{3}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 低秩后量化 & 36.82 & 44.91 & 25.47 &62.31  &  64.64 &  53.44 & 46.61 \\
+            & 低秩感知量化+量化$Q$  & \textbf{40.27} &\textbf{46.05}  & \textbf{25.76}  & 62.31 & \textbf{64.64}  &53.4 & 47.54\\
+            & 低秩感知量化+全精度$Q$ &40.25 & 44.92  &  23.57 & \textbf{62.74} & 64.33 & \textbf{62.25} &  \textbf{47.78} \\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{对比不同量化策略在相同 KV 压缩预算下对长文本能力（LongBench）的影响。}
+    %\caption*{最优效果用粗体表示}
+\end{table}
+
+\textbf{Value的低秩感知量化与纯量化对比：} \space 低秩感知的混合精度量化的第二组消融实验是比较其与对完整不分解Value直接进行量化的压缩方式的性能差异。为了较明显地展示性能的差异，我们采取了75\%的Key和Value的压缩率：对于Key，使用本研究提出的低秩压缩算法将其压缩为原本的25\%；对于Value则采取两种不同的压缩方式。(i) \textbf{均匀量化}：直接对完整的Value缓存使用4比特精度进行压缩，将其所占显存变为完整模型的25\%；(ii)\textbf{低秩感知量化}：根据Value使用我们的层间秩分配算法分配到的压缩率，逐层根据低秩感知的混合精度量化算法将头部和尾部奇异值分别压缩为6比特和3比特，以实现Value整体压缩率为75\%。
+
+\begin{table}[htbp]
+    \centering
+    \caption{Value低秩感知量化 v.s. 纯量化：困惑度 ($\downarrow$)与 零样本推理准确率($\uparrow$)：最优效果用粗体表示。}
+    \label{tab:ppl-acc-quant-ablation-llama-2}
+    \renewcommand{\arraystretch}{1.12}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llcc ccccccccc}
+        \toprule
+        \textbf{模型} & \textbf{方法} &
+        \multicolumn{2}{c}{\textbf{Perplexity} $\downarrow$} &
+        \multicolumn{9}{c}{\textbf{准确率} (\%) $\uparrow$} \\
+        \cmidrule(lr){3-4}\cmidrule(lr){5-13}
+        & & \textbf{WikiText-2} & \textbf{PTB} &
+        \textbf{BoolQ} & \textbf{HellaSwag} & \textbf{OpenBookQA} & \textbf{ARC-C} & \textbf{ARC-E} & \textbf{Winogrande} & \textbf{PIQA} & \textbf{CEval} & \textbf{Avg} \\
+        \midrule
+        \multirow{3}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+            & 完整模型 & 7.21 & 12.33 & 80.04 & 79.27 & 43.00 & 55.03 & 79.59 & 73.95 & 81.01 & 54.23 & 68.77 \\
+            \cmidrule(lr){2-13}
+            & 均匀量化 (75\%) & 7.67 & 12.99 & \textbf{84.37} & \textbf{78.62} & \textbf{44.60} & 53.84 & 78.41 &  74.27 & 80.36 & 51.63 &  68.26 \\
+            & 低秩感知量化(75\%) & \textbf{7.59} & \textbf{12.89} & 84.01 & 78.60 & 43.40 &  \textbf{54.52} & \textbf{79.88} & \textbf{74.66} & \textbf{80.85} & \textbf{52.38} &  \textbf{68.54} \\
+            
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{最优效果用粗体表示}
+\end{table}
+
+
+\begin{table}[htbp]
+    \centering
+    \caption{Value低秩感知量化 v.s. 纯量化：LongBench 得分($\uparrow$)：最优效果用粗体表示。}
+    \label{tab:longbench-quant-ablation-llama-2}
+    \renewcommand{\arraystretch}{1.12}
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llccccccc}
+        \toprule
+        \textbf{模型} & \textbf{方法} &
+        \textbf{Multi-doc QA} & \textbf{Single-doc QA} & \textbf{Summarization} &
+        \textbf{Few shot} & \textbf{Synthetic} & \textbf{Code} & \textbf{Avg} \\
+        \midrule
+        \multirow{3}{*}{\shortstack{\textbf{Llama3.1-8B}\\\textbf{-Instruct}}}
+        & 完整模型 & 42.09 & 47.54 & 26.28 & 63.58 & 68.15 & 60.03 & 49.64 \\
+        \cmidrule(lr){2-9}
+            & 均匀量化 (75\%) & 39.05 & 45.46 & 25.42 & \textbf{63.39}  &  61.44 &  \textbf{55.46} & 47.07 \\
+            & 低秩感知量化(75\%) & \textbf{39.75} & \textbf{46.28}  & \textbf{26.02}  & 62.59 & \textbf{63.49} & 54.89 & \textbf{47.59}\\
+        \bottomrule
+    \end{tabular}}
+    \vspace{4pt}
+    %\caption*{最优效果用粗体表示}
+\end{table}
+
+通过表~\ref{tab:ppl-acc-quant-ablation-llama-2}和~\ref{tab:longbench-quant-ablation-llama-2}中对Value均匀 4比特量化与Value低秩感知混合精度量化（头部 6比特 / 尾部 3比特）的对比可以看到，低秩感知量化在语言建模上带来更小的退化：WikiText-2/PTB 的 困惑度 分别由 7.67/12.99 降至 7.59/12.89。与此同时，其零样本平均准确率也由 68.26 提升至 68.54，并在 ARC-E、Winogrande、PIQA、CEval 等任务上更稳定。长文本能力方面（LongBench），低秩感知量化在 Multi-doc QA、Single-doc QA、Summarization 与 Synthetic 上均优于均匀量化，使平均得分从 47.07 提升到 47.59。上述结果表明，在相同压缩率下，按奇异值信息量分配数值精度能更有效地控制量化误差，从而更好地保持 Value 缓存中的有效信息，相比直接均匀量化完整的Value缓存有更小的精度损失。
+
+\section{本章小结}
+本章围绕本文提出的 KV 缓存压缩框架，面向语言建模、零样本推理与长上下文理解三类代表性场景进行了系统实验验证，并在不同模型与多种压缩率预算下对比了现有的KV特征维度压缩和量化压缩方法与本研究提出的KV压缩方案的性能差异。总体而言，实验结果表明：在相同 KV 缓存预算下，本文设计的注意力-激活值感知的SVD分解方案和基于当前秩分配下层重要程度的动态迭代秩分配算法相较于此前基于SVD的KV缓存特征压缩方案有更好的性能。进一步引入我们提出的低秩感知量化对代替直接丢弃尾部奇异值对Value进行压缩时，能够进一步减少信息损失，提高模型精度。
+在追求更高压缩率的场景下，本研究提出的"低秩感知混合精度量化"能更好地将特征维压缩和量化压缩结合，与单一使用量化技术路线以及此前方法中的"低秩裁剪后量化"相比都有更好的效果。%并且我们还进一步提出了一种利用量化后低精度矩阵乘法加速Value重建的可能思路。 的低秩感知混合精度量化基础上几乎不牺牲模型精度优化了Value缓存的重建开销。
+
+
+在 50\% 压缩率下，我们首先验证了本文提出的“注意力--激活值感知”的低秩KV压缩方案能够在语言建模与下游推理任务上稳定优于现有低秩压缩基线：在 WikiText-2 与 PTB 上，我们的方法在相同 rank 预算下取得更低的困惑度；在多项零样本推理任务上，压缩后的模型仍能保持接近完整模型的知识与推理能力。进一步地，在 LongBench 长文本评测中，本文方法在长文本任务上表现更稳健，说明在极长上下文下，我们的方法能够进一步减少低秩分解的误差累积，提高每层KV表征的稳定性。在引入“低秩感知的量化”对Value进行压缩后，所有任务上模型的精度下降会进一步减少。% 而更贴近推理计算目标的分解方式和在目标压缩率下考虑每层重要程度的秩分配方案能够有效提升每层KV表征的稳定性。
+在更保守的 30\% 压缩设定下，实验验证了本文在较低压缩率能够在语言建模和各类下游任务上做到几乎无损。在更高的75\%和87.5\%压缩率上，使用低秩感知的混合精度量化作为结合本研究提出的特征维压缩方法和SOTA量化方法的框架，能够实现比单独使用SOTA量化方法更少的模型性能下降，在语言建模、零样本推理与 LongBench 长文本任务三类评测上取得一致收益。我们还通过长文本推理的实验说明在显存资源受限的场景下，本文所提的方法能够大幅提高模型能正常推理的文本长度上限，并在各类任务上都能很好的保持原模型的精度。% 本章进一步展示了本文方法在“高精度优先”场景中的适用性：语言建模指标基本保持不变，长文本得分与完整模型差距很小；同时在零样本推理任务上，压缩模型在若干基准上出现小幅提升，表明适度压缩可能在推理阶段减少冗余通道对注意力输出的干扰，从而对泛化产生正向影响。该结果说明本文方法不仅在中高压缩率下具备优势，在接近无损的压缩区间同样具有良好的鲁棒性。
+
+
+消融实验进一步明确了各模块带来的增益来源。对于低秩 KV 缓存特征压缩部分，我们将 Palu 的分解方案/秩分配方案与本文对应模块进行交叉组合，结果表明两者对模型精度都有贡献：注意力--激活值感知的 SVD 分解能够更好地对齐推理阶段真实的注意力计算，从而在相同压缩率下更有效地保留关键信息；而基于当前秩分配估计层重要程度并进行动态迭代重分配的策略，则能在全局预算约束下把有限 rank 更集中地分配给更重要的层减少模型输出误差。%高敏感层，抑制误差在深层网络中的传播与累积，最终在语言建模、零样本推理以及长文本任务上获得更稳定的整体提升。
+我们还进行了“低秩感知的混合精度量化”与“低秩裁剪后量化”、对比的消融实验，实验结果表明本研究提出的方法相较于“非1即0”的丢弃方式能够保留Value更多的信息，并且也提供了一种更好的结合特征维度和量化压缩方法的范式。我们也对是否量化重建矩阵$Q$进行消融验证了提出的低精度矩阵乘加速Value重建思路不会对模型效果有大的影响。
+
+%对于高压缩率场景下的“低秩+量化”部分，本章通过量化策略消融验证了本文提出的低秩感知混合精度量化的必要性：与“低秩裁剪后统一量化”相比，我们的策略通过区分秩的重要性，对 Value 的头部信息维持较高精度、对长尾信息使用较低精度但不直接丢弃，从而更好地应对 Value 侧低秩性不足带来的信息损失问题，并在 PPL、零样本推理与 LongBench 三类评测上取得一致收益。进一步地，为降低在线重建开销并提升推理效率，我们对 Value 重建矩阵 $Q$ 进行了量化；实验显示在几乎不影响模型精度的前提下即可理论上减少重建侧的计算与存储成本，从而使本文方案在“精度--存储--效率”的三目标上获得更优的综合折中。
+
+综上，本章从多任务、多模型与多压缩预算
+三个维度系统验证了本文方法的有效性：在适中压缩率下，注意力-激活值感知分解与动态迭代秩分配带来稳定精度优势，对Value使用低秩感知的量化压缩尾部奇异值后能带来更大性能收益；在更高压缩率下，低秩感知混合精度量化还能提供一种更好的结合特征维度压缩和量化压缩的框架，进一步提升KV缓存压缩上限，相比单独使用量化技术有更小的精度损失。
+
+%并可在几乎不牺牲精度的条件下优化重建效率，为长上下文推理与实际部署提供了更优的 KV 缓存压缩方案。

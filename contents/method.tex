@@ -1,0 +1,868 @@
+% !TEX root = ../main.tex
+
+% -----------------------------------------------------------------------------
+% Method (combined)
+% This file consolidates:
+%   - contents/methdology1.tex
+%   - contents/methdology2.tex
+%   - contents/methdology3.tex
+% -----------------------------------------------------------------------------
+
+% ===== Begin: methdology1 =====
+\chapter{基于低秩性质的KV缓存压缩方法}
+\label{chap:method}
+
+\section{注意力与激活感知的低秩KV缓存特征压缩}
+\label{chap:scaling_svd}
+为了进一步减少特征维度压缩KV缓存导致的模型性能损失，本章提出一种同时建模激活值与注意力分布的基于SVD的低秩特征压缩算法。传统 SVD 分解直接以参数矩阵 $W_k$、$W_v$ 的低秩近似为优化目标，忽略了推理阶段模型真实使用的是 $XW_k$、$AXW_v$ 等乘积。\textcolor{red}{}此前的方法\cite{yuan2023asvd,chang2025palu}考虑到了参数矩阵输入的激活值对参数矩阵低秩误差的影响，通过激活值的分布来指导参数矩阵的SVD分解，相较于直接分解有了一定提升。我们考虑到在注意力层中除了激活值$X$外，对于Value的参数矩阵$W_v$，注意力分数$A$也会参与计算，最终$AXW_v$为注意力输出。因此额外考虑注意力分数$A$对V缓存低秩分解的影响可以进一步减少近似误差。% 注意力分数 $A$ 和层内激活 $X$ 会与 $W_k$、$W_v$ 相乘，其结果才决定 KV 缓存的能量分布与误差放大。
+本章针对"注意力-激活值-参数矩阵"的共同作用构建并求解优化问题，显式在SVD的优化目标中引入激活值和注意力，使保留下来的奇异向量最大程度对齐模型推理时的效果；我们的算法在保留SVD降维可解释性的同时，更贴合推理过程中的真实运算。
+
+
+\subsection{背景知识与问题描述}
+为了后续方法推导能够更清晰地衔接，本节首先回顾我们将在后续章节频繁使用的低秩分解基本原理，并梳理大模型常见的Grouped-Query Attention(GQA)架构。SVD提供了对参数矩阵进行最优低秩近似的基础手段，而GQA已经成为主流大模型在长上下文推理中控制KV缓存成本的关键结构，因此我们在设计压缩方案时必须同时考虑到常规的MHA和GQA。
+
+\subsubsection{奇异值分解}
+
+奇异值分解（Singular Value Decomposition, SVD）是描述任意实矩阵能量分布的标准工具。对尺寸为 $m\times n$ 的矩阵 $A$，SVD（图\ref{SVD}）给出
+\[
+A = U\Sigma V^\top,
+\]
+其中 $U\in\mathbb{R}^{m\times \min(m,n)}$、$V\in\mathbb{R}^{n \times \min(m,n)}$ 为正交矩阵，$\Sigma=\mathrm{diag}(\sigma_1,\sigma_2,\ldots,\sigma_{\min(m,n)})$ 为按降序排列的非负奇异值。$\sigma_i^2$ 表示 $A$ 在对应奇异向量方向上的能量，满足 $\|A\|_F^2 = \sum_i \sigma_i^2$。
+
+在计算低秩逼近时，可将 $A$ 的前 $r$ 个奇异值和奇异向量截断，得到秩-$r$ 矩阵
+\[
+A_r = U_r \Sigma_r V_r^\top,
+\]
+其中 $U_r$、$V_r$ 分别为保留前 $r$ 列的列正交矩阵，$\Sigma_r$ 为前 $r$ 个奇异值构成的对角阵。按照 Eckart–Young–Mirsky 定理，$A_r$ 是在 Frobenius 范数与谱范数下对 $A$ 最优的秩-$r$ 近似。这一性质为 KV 特征降维提供了明确的误差界：截断掉的能量 $\sum_{i>r} \sigma_i^2$ 即为重建误差的上界。
+
+实际求解 SVD 时常用两类方法：（1）直接的全量分解，适用于维度相对较小或离线处理；（2）增量式/随机化 SVD，如 randomized SVD、power iteration，可在大规模矩阵上以较低时间/存储开销求得近似奇异子空间。在本章后续算法中，我们以增量式 SVD 为基础，结合注意力与激活加权重新定义目标函数，使所保留的奇异向量更准确地对齐推理阶段真正参与运算的$XW_k$、$AXW_v$产物。
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+      matA/.style={minimum width=2.2cm, minimum height=3cm, draw, line width=1pt},
+      matU/.style={minimum width=2.2cm, minimum height=3cm, draw, line width=1pt},
+      matSquare/.style={minimum width=2.2cm, minimum height=2.2cm, draw, line width=1pt},
+      >=Latex, font=\small
+    ]
+
+    % A
+    \node[matA,fill=blue!15] (A) at (0,0) {$A_{m\times n}$};
+    \draw[decorate,decoration={brace,amplitude=4pt},line width=0.8pt]
+      (-1.1,1.7) -- (1.1,1.7) node[midway,above=3pt] {$n$};
+    \draw[decorate,decoration={brace,amplitude=4pt},line width=0.8pt]
+      (-1.4,-1.5) -- (-1.4,1.5) node[midway,left=3pt] {$m$};
+
+    % equal sign
+    \node at (1.5,0) {$=$};
+
+    % U
+    \node[matU,fill=green!15] (U) at (3.0,0) {$U_{m\times n}$};
+
+    % multiply sign
+    \node at (4.4,0) {$\times$};
+
+    % Sigma
+    \node[matSquare,fill=yellow!20] (S) at (5.8,0) {$\Sigma_{n\times n}$};
+
+    % multiply sign
+    \node at (7.2,0) {$\times$};
+
+    % V^T
+    \node[matSquare,fill=orange!20] (V) at (8.6,0) {$V_{n\times n}^{\top}$};
+
+    % labels
+    \node[below=4pt] at (3.0,-1.7) {左奇异向量};
+    \node[below=4pt] at (5.8,-1.7) {奇异值};
+    \node[below=4pt] at (8.6,-1.7) {右奇异向量$^{\top}$};
+
+  \end{tikzpicture}
+  \caption{矩阵 $A$ 的奇异值分解示意：$A = U\Sigma V^\top$（$m>n$）。}
+  \label{SVD}
+\end{figure}
+\subsubsection{GQA（Grouped-Query Attention）}
+主流开源大模型在长上下文推理场景中广泛采用Grouped-Query Attention(GQA)以降低推理端的KV缓存占用。与标准多头注意力(MHA)为每个Query头都分配独立的Key/Value投影不同，GQA将$H$个Query头划分为$G$个分组，每个分组共享同一套$W_{k,g}$与$W_{v,g}$。该结构在推理阶段只需要维护$G$份KV缓存，显著减少了显存消耗，并能够在相同硬件条件下支撑更长的序列或更大的批量。图\ref{fig:enter-label}展示了GQA中Query，Key和Value的对应关系。
+
+
+GQA把多个Query头的上下文需求折叠到同一份$K_g/V_g$中，因此，我们在问题建模阶段显式引入$g$和$h$两个层级的索引，同时刻画“分组”和“头内”两个维度：$g$捕捉不同分组共享同一套KV投影的约束，$h$刻画被同一分组复用的多个Query头的注意力反馈。只有让低秩压缩同时考虑到$\{g,h\}$两个轴，我们才能在后续推导中准确分析误差如何在GQA结构中传播，并设计兼容主流大模型的KV压缩方案。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.65\linewidth]{figures/GQA.pdf}
+    \caption{GQA架构}
+    \label{fig:enter-label}
+\end{figure}
+
+\subsubsection{基于低秩分解的KV缓存特征维压缩}
+\label{sec:low rank approximate}
+图\ref{fig:lowrank}展示了使用SVD存储中间值来压缩KV缓存的示意。原始的Key/Value变换矩阵$W_k$、$W_v$先通过SVD分解成$P$和$Q$两个较小的矩阵$W\approx PQ$，其中$P=U\sqrt{\Sigma}$，$Q=\sqrt{\Sigma}V^T$。推理时不再直接生成并缓存完整的$K=XW_k$、$V=XW_v$，而是先计算中间值$K'=XP_k$,$V'=XP_v$并写入缓存，随后在需要重建完整KV向量时再右乘$Q$。这一设计允许我们以$\mathcal{O}(l\times r)$的存储成本代替原本$\mathcal{O}(l \times d)$的KV缓存，其中$r\ll d$是保留的秩，$l$是KV缓存中保留的词元数。由于SVD提供了给定秩约束下最优的F范数近似，主能量集中在前几个奇异值的KV矩阵可以在较小秩下保持高保真度。
+
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/low_rank.pdf}
+    \caption{SVD降维压缩KV}
+    \label{fig:lowrank}
+\end{figure}
+
+直接对$W_k$、$W_v$进行SVD分解，并根据分配给该层的KV参数矩阵的预算来保留一部分秩，是Eckart–Young–Mirsky定理下对$W_k$、$W_v$的最优低秩近似。但对参数矩阵的最优近似并不一定能最大程度保留完整模型的效果。这是因为SVD的优化目标是寻找到低秩矩阵$P$、$Q$相乘使结果与原参数矩阵的误差最小:
+\[
+\min_{\{P_{k/v,h},Q_{k/v,h}\}}\sum_{h=1}^\mathcal{H}\bigl\|W_{k/v,h}-P_{k/v,h}Q_{k/v,h}\bigr\|_F^2,
+\]
+其中$\mathcal{H}$表示MHA中的注意力头数。如果考虑GQA，则优化目标应该改写为:
+\[
+\min_{\{P_{k/v,g},Q_{k/v,g}\}}\sum_{g=1}^G\bigl\|W_{k/v,g}-P_{k/v,g}Q_{k/v,g}\bigr\|_F^2,
+\]
+$G$表示模型每一层GQA中的Key/Value的组数。后续我们的推导都将在GQA的架构下进行，因为MHA相当于$\mathcal{H}=G$的特殊情况下的GQA。
+而在模型推理过程中，注意力层在计算Key矩阵的时候$W_k$需要与激活值$X$相乘，因此对于Key矩阵压缩前后我们想要最小化的目标实际应该为：
+\[
+\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G\bigl\|XW_{k,g}-XP_{k,g}Q_{k,g}\bigr\|_F^2,
+\]
+显而易见，其最优解的$P$、$Q$将不再是由$W_k$、$W_v$的SVD得到。对于Value缓存的低秩近似，则会更复杂一些。模型注意力层中第$h$个头的注意力层计算的结果为：
+\[
+ \operatorname{Attention}(Q_h,K_{\left\lfloor \frac{h}{G} \right\rfloor},V_{\left\lfloor \frac{h}{G} \right\rfloor}) = \operatorname{softmax}\left(\frac{Q_hK_{\left\lfloor \frac{h}{G} \right\rfloor}^\top}{\sqrt{d_k}}\right)V_{\left\lfloor \frac{h}{G} \right\rfloor}=A_{h}XW_{v,\left\lfloor \frac{h}{G} \right\rfloor}.
+\]
+其中$\left\lfloor \frac{h}{G} \right\rfloor$表示Query第$h$个注意力头除以总的KV组数后向下取整，为对应该Query的KV组索引数。$d_k$表示Query和Key的特征维度，用来维持计算结果的数值稳定。
+
+从注意力层的计算可以发现，$W_v$不仅会与激活值$X$相乘，还要进一步和注意力分数矩阵$A$做计算。考虑到后续推导都使用GQA，因此后续所有出现的小写索引$h$符号都专门用于标识某个GQA分组内部被复用的Query头编号（例如$h=1,\dots,H$），不再表示传统MHA中的“全局第$h$个head”，以避免符号歧义。因此对于Value矩阵压缩前后需要最小化的实际目标应该为：
+\[
+\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\bigl\|A_{g,h}XW_{v,g}-A_{g,h}XP_{v,g}Q_{v,g}\bigr\|_F^2,
+\]
+至此，我们已经给出了最朴素的低秩优化目标形式。接下来的“激活感知的Key投影低秩分解”与“注意力-激活感知的Value投影低秩分解”两节，将在这一基础上进一步讨论如何构造并求解得到更贴近实际推理过程的$P/Q$矩阵。
+
+
+\subsection{激活与注意力感知的低秩求解}
+\subsubsection{激活感知的Key投影低秩分解}
+\label{sec:key_decomposition}
+为了通过低秩分解并存储中间值的范式对Key缓存进行压缩，我们需要对原本分解的目标$W_k$进行一些变换，再进行分解才能够得到在\ref{sec:low rank approximate}中优化问题的最优解。我们将对$W_k$做乘法变换的矩阵记为$S_k$，对$S_kW_k$进行低秩分解，则优化问题可以写为：
+\[
+\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G\bigl\|XS_k^{-1}S_kW_{k,g}-XS_k^{-1}P_{k,g}Q_{k,g}\bigr\|_F^2,    
+\]
+矩阵$M$的Frobenius范数的平方等于其转置与其自身相乘结果的迹：
+\begin{equation}
+    \bigl\|M\bigl\|_F^2 = \operatorname{tr}(M^\top M) \label{eq:Ftotrace}
+\end{equation}
+%在这里我们引入一个引理：
+%\begin{lemma}\label{lem:Ftotrace}
+    %矩阵$M$的Frobenius范数的平方等于其转置与其自身相乘结果的迹
+  %\[\bigl\|M\bigl\|_F^2 = \operatorname{tr}(M^\top M)\]
+%\end{lemma}
+因此上述式子可以进一步推导：
+\begin{align}
+  & \min_{\{P_{k,g},Q_{k,g}\}}
+  \sum_{g=1}^G \Bigl\| X S_k^{-1} S_k W_{k,g} - X S_k^{-1} P_{k,g} Q_{k,g} \Bigr\|_F^2 \\
+   = & \min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \Bigl\| X \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr) \Bigr\|_F^2 \\
+ =  &\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \operatorname{tr}\Bigl[
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)^\top
+       X^\top X
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)
+     \Bigr]. \label{eq:1} \\
+\intertext{后续推导需要使用cholesky矩阵分解，这里先对其进行介绍：对于任意对称正定矩阵$M\in\mathbb{R}^{d\times d}$，存在唯一的下三角矩阵$L$（对角元素为正）满足$M = LL^\top$。和SVD-LLM\cite{wangsvd}以及Palu\cite{chang2025palu}中的推导思路一致，我们将cholesky分解用到~\eqref{eq:1}的$X^{\top}X$上，令$X^{\top}X=LL^\top$，并令$S_k=L^\top$，可继续推导：}%&\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \operatorname{tr}\Bigl[
+       %\bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)^\top
+       %X^\top X
+       %\bigl(W_{k,g} - S_k^{-1} P_{k,g} %Q_{k,g}\bigr)
+     %\Bigr] \\
+     = & \min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \operatorname{tr}\Bigl[
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)^\top
+       S_k^\top S_k
+       \bigl(W_{k,g} - S_k^{-1} P_{k,g} Q_{k,g}\bigr)
+     \Bigr] \label{eq:2}  \\  
+     =  &\min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \Bigl\| S_k S_k^{-1} S_k W_{k,g} - S_k S_k^{-1} P_{k,g} Q_{k,g} \Bigr\|_F^2 \label{eq:3} \\ 
+    = & \min_{\{P_{k,g},Q_{k,g}\}}\sum_{g=1}^G \Bigl\| S_k W_{k,g} - P_{k,g} Q_{k,g} \Bigr\|_F^2. \label{eq:4}
+\end{align}
+
+其中从 \eqref{eq:2} 到 \eqref{eq:3} 的变换依赖 ~\eqref{eq:Ftotrace} 给出的“Frobenius 范数平方等价于迹”的性质。最终我们把原问题化简为对 $S_k W_{k,g}$ 的低秩近似，即找到秩 $r$ 的 $P_{k,g}$、$Q_{k,g}$ 使得 \eqref{eq:4} 的误差最小。若仅对每个分组独立分解，Eckart–Young–Mirsky 定理说明对每个 $S_k W_{k,g}$ 单独做 SVD 并截取前 $r$ 个奇异值即可获得最优解。但Palu\cite{chang2025palu} 的实验与THINKV\cite{xuthink} 的理论分析进一步指出：把所有分组的矩阵按列拼接成$[S_k W_{k,1},\dots,S_k W_{k,G}]$ 再做一次联合 SVD，能让主要奇异值集中在共享子空间中，整体重构误差显著低于逐分组分解。因此，我们在实现时采用“先拼接、后分解”的策略，从联合 SVD 中一次性计算所有分组的 $P$和$Q$。由于参数矩阵$W_k$本来就是由$[W_{k,1},\dots,W_{k,G}]$按列拼接而成，因此直接对$S_kW_k$做SVD即可。
+
+通过这种方式，我们就能给 Key 投影找到一套“先预变换再分解”的流程：先利用 $S_k=L^\top$ 将激活协方差吸收到 $S_kW_{k,g}$ 中，再在这一坐标系里做标准的低秩近似。为了保证推理阶段仍能恢复原始尺度，我们只需要在缓存侧保存 $XS_k^{-1}P_{k,g}$，需要完整 Key 时再右乘 $Q_{k,g}$ 即可。并且需要注意的一点是，由于$S_kW_{k,g}$注意力分组在其列上，因此对其做SVD之后，只有$Q_{k,g}$是每组不同的，而$P_{k,g}$对每组是相同的，可以去掉下标$g$用$P_{k}$来表示，因此只需要存储一份$XS_{k}^{-1}P_k$。
+
+\subsubsection{注意力-激活感知的Value投影低秩分解}
+同样地，为了能够通过低秩分解并存储中间值的范式对Value缓存进行压缩，我们也需要对原本分解的目标$W_v$做一定变换。与对$W_k$进行变换时只考虑激活值不同，$W_v$在注意力层中还需要与注意力分数做矩阵乘法计算，并且Value的每个组要分别和$\left\lfloor \frac{H}{G} \right\rfloor$个不同的注意力分数$A_{g,h}$相乘，因此优化问题也更复杂一些。ALRD中给出了求解建模注意力和激活值影响下对变换后的参数矩阵$W_v$做低秩近似的一种方案，而本文中进一步考虑了由于每个注意力组的$W_{v,g}$要与不同的注意力分数进行计算导致的差异，对每个$W_{v,g}$分别进行了不同的变换，即分别对其乘以不同的$S_{v,g}$，赋予了变换矩阵更大的自由度。
+
+每个注意力组都包含$H$个注意力头，一共有$G$个注意力组，我们考虑组内各注意力头不同注意力分数的低秩近似优化目标对注意力组和每组内的注意力头这两个维度进行求和：
+\[
+\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\bigl\|A_{g,h}XS_{v,g}^{-1}S_{v,g}W_{v,g}-A_{g,h}XS_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr\|_F^2,
+\]
+其中$P_{v,g}Q_{v,g}$是对$S_{v,g}W_{v,g}$的低秩近似。由~\eqref{eq:Ftotrace}可以将上式写成矩阵转置乘矩阵的迹的形式:
+\begin{align}
+&\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\bigl\|A_{g,h}XS_{v,g}^{-1}S_{v,g}W_{v,g}-A_{g,h}XS_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr\|_F^2 \\
+= &\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\bigl\|A_{g,h}X\bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)\bigr\|_F^2
+\\
+= &\min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\sum_{h=1}^H\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       X^\top A_{g,h}^\top A_{g,h} X
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr] \\
+\intertext{由于求和的元素中只有$A_{g,h}$和头的索引有关，因此对头的求和号等价于只作用与$A_{g,h}$:}
+     = & \min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       \bigl(\sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X\bigr]\bigr)
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr] \\
+\intertext{我们继续对每个注意力组的$\sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X\bigr]$做cholesky分解，并将分解得到的矩阵赋值给每个注意力组的$S_{v,g}$：$\sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X\bigr] = S_{v,g}^\top S_{v,g}$。将$S_{v,g}^\top S_{v,g}$代入：}
+= & \min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\operatorname{tr}\Bigl[
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)^\top
+       S_{v,g}^\top S_{v,g}
+       \bigl(W_{v,g}-S_{v,g}^{-1}P_{v,g}Q_{v,g}\bigr)
+     \Bigr] \\
+\intertext{根据~\eqref{eq:Ftotrace}，将迹的形式变为F范数平方的形式：}
+    = & \min_{\{P_{v,g},Q_{v,g}\}}\sum_{g=1}^G\bigl\|S_{v,g}W_{v,g}-P_{v,g}Q_{v,g}\bigr\|_F^2
+\end{align}
+与对$S_kW_k$所有的注意力组进行联合分解代替逐个分解相同，为了进一步减少信息的损失，我们对每个注意力组的矩阵按列拼接成$[S_{v,1} W_{v,1},\dots,S_{v,G} W_{v,G}]$ 再进行联合分解。对Key进行低秩近似时直接对$W_k$乘以$S_k$再分解就能起到联合分解的效果，但对Value分解时由于每个注意力组乘的$S_{v,g}$不同，因此需要逐个组计算$S_{v,g}W_{v,g}$并拼接之后再分解。我们将 $[S_{v,1} W_{v,1},\dots,S_{v,G} W_{v,G}]$的拼接与联合 SVD 操作可视化在图\ref{fig:dec_and_rec}中。
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=1\linewidth]{figures/figure_dec_and_rec.pdf}
+    \caption{$W_v$的变换，拼接和联合分解}
+    \label{fig:dec_and_rec}
+\end{figure}
+
+由于注意力组的划分是在参数矩阵$W_v$的列上的，因此对其变换并进行SVD之后每个注意力组是共享同一个$P_v$的，而$Q_{v,g}$则是每组不同的。需要特别考虑的一个问题是，Value 在逆变换阶段无法像 Key 那样共享一个全局的 $S^{-1}$。Key 的变换矩阵在所有分组间一致，因此我们可以一次性用 $S_k^{-1}$ 计算得到缓存中的 $XS_k^{-1}P_{k}$。而 Value 为了兼顾注意力分布在每组的差异，对每个分组都引入了独立的 $S_{v,g}$。因此复原Value时必须对每组的低秩重建应用对应的逆变换矩阵。缓存的低维Value矩阵$\widehat{V}$为：
+\begin{equation}
+    \widehat{V} = \bigl[XS_{v,1}^{-1}P_v,...,XS_{v,G}^{-1}P_v\bigr]
+\end{equation}
+是由每个注意力组的$XS_{v,g}^{-1}P_v$拼接而成。其特征维度由原本的$d$变成了$G\times r$。需要存储在V缓存中的矩阵大小反而更大了，这是每个注意力组的逆变换矩阵不同导致的。因此，为了解决该问题，我们需要人为控制每个注意力组的逆变换矩阵$S_{v,g}^{-1}$相同。我们这里提出的解决方案是通过求解优化问题来得到一个公用的$S_{v}^{-1}$，使得通过$S_{v}^{-1}$计算得到的低秩Value参数矩阵的近似与实际的低秩Value参数矩阵之间的差异最小，这个思路可视化在图\ref{fig:S_approximate}中。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=1\linewidth]{figures/S_approximate.pdf}
+    \caption{用相同$S_{v}^{-1}$近似$\widehat{V}$}
+    \label{fig:S_approximate}
+\end{figure}
+
+我们从最小二乘优化问题的角度求解得到$S_v^{-1}$，求得一个$S_v^{-1}$使分解重建前后的参数矩阵差异最小，即$\bigl[S_{v,1}^{-1}P_vQ_{v,g},...,S_{v,G}^{-1}P_vQ_{v,g}\bigr]$与$\bigl[S_v^{-1}P_vQ_{v,g},...,S_v^{-1}P_vQ_{v,g}\bigr]$之差的F范数的平方最小：
+\begin{align}
+    & \min_{S_v}\sum_{g=1}^G\bigl\|S_{v,g}^{-1}P_{v}Q_{v,g} - S_v^{-1}P_{v}Q_{v,g} \bigr\|_F^2 \\
+= & \min_{S_v}\sum_{g=1}^G\bigl\|\bigl(S_{v,g}^{-1} - S_v^{-1}\bigr)P_{v}Q_{v,g}  \bigr\|_F^2 \\
+\intertext{使用~\eqref{eq:Ftotrace}，将F范数平方的形式转化为矩阵迹的形式：}
+     = &\min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[\bigl(S_{v,g}^{-1} - S_v^{-1}\bigr)P_vQ_{v,g}Q_{v,g}^\top P_v ^\top\bigl(S_{v,g}^{-1} - S_v^{-1}\bigr)^\top \bigr] \\
+\intertext{由于$Q_{v,g}$是SVD得到的，因此是正交矩阵，它的转置等于它的逆：$Q_{v,g}Q_{v,g}^\top=I$。将其代入上式：}
+    = & \min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[\bigl(S_{v,g}^{-1} - S_v^{-1}\bigr)P_v P_v^\top \bigl(S_{v,g}^{-1} - S_v^{-1}\bigr)^\top \bigr] \\
+    = &
+    \min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_{v,g}^{-1}P_vP_v^\top (S_g^{-1})^\top- S_{v,g}^{-1}P_vP_v^\top (S_v^{-1})^\top- S_v^{-1}P_vP_v^\top(S_{v,g}^{-1})^\top+S_v^{-1}P_vP_v^\top(S_v^{-1})^\top \bigr] \label{eq:24} \\
+\intertext{由于矩阵的迹与矩阵转置的迹相同，并且矩阵求和的迹与矩阵迹求和也相同，因此\eqref{eq:24}中的$\operatorname{tr}(S_{v,g}^{-1}P_vP_v^\top (S_v^{-1})^\top)$和$\operatorname{tr}(S_v^{-1}P_vP_v^\top(S_{v,g}^{-1})^\top)$相等且可以合并：}
+\iff & \min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_{v,g}^{-1}P_vP_v^\top (S_{v,g}^{-1})^\top - 2S_{v,g}^{-1}P_vP_v^\top (S_v^{-1})^\top + S_v^{-1}P_vP_v^\top(S_v^{-1})^\top \bigr] \label{eq:25} \\
+\intertext{式子~\eqref{eq:25}中的第一项$S_g^{-1}P_vP_v^\top (S_g^{-1})^\top$为定值，与要求优化问题的解$S_v$无关，因此可以将其从优化问题中丢掉：}
+= &\min_{S_v}\sum_{g=1}^G\operatorname{tr}\bigl[S_v^{-1}P_vP_v^\top(S_v^{-1})^\top -2S_{v,g}^{-1}P_vP_v^\top (S_v^{-1})^\top \bigr] \label{eq:26} \\
+\intertext{~\eqref{eq:26}中的第一项与分组$g$无关，在求和号下相当于乘以了G倍数，求和号可以看作只作用于$2S_{v,g}^{-1}P_vP_v^\top (S_v^{-1})^\top$上。}
+    = & \min_{S_v}\operatorname{tr}\bigl[G \times S_v^{-1}P_vP_v^\top(S_v^{-1})^\top - 2\sum_{g=1}^G S_{v,g}^{-1}P_vP_v^\top (S_v^{-1})^\top \bigr] \label{eq:27} \\
+\intertext{~\eqref{eq:27}等价于对优化问题除以G，令$\frac{\sum_{g=1}^G S_{v,g}^{-1}}{G}=\overline{S_{v,g}^{-1}}$：}
+    \iff & \min_{S_v}\operatorname{tr}\bigl[ S_v^{-1}P_vP_v^\top(S_v^{-1})^\top - 2\overline{S_{v,g}^{-1}}P_vP_v^\top (S_v^{-1})^\top \bigr] \\
+\intertext{为了后续推导方便，将与优化目标无关的一项$\overline{S_{v,g}^{-1}}P_vP_v^\top\overline{ (S_{v,g}^{-1})}^\top$加到优化问题中，相当于一个常数项：}
+    \iff & \min_{S_v}\operatorname{tr}\bigl[ S_v^{-1}P_vP_v^\top(S_v^{-1})^\top - 2\overline{S_{v,g}^{-1}}P_vP_v^\top (S_v^{-1})^\top + \overline{S_{v,g}^{-1}}P_vP_v^\top\overline{ (S_{v,g}^{-1})}^\top \bigr] \\
+    = & \min_{S_v}\operatorname{tr}\bigl[\bigl(S_v^{-1}-\overline{S_{v,g}^{-1}}\bigr)P_vP_v^\top\bigl(S_v^{-1}-\overline{S_{v,g}^{-1}}\bigr)^\top \bigr] \\
+\intertext{最后再由~\eqref{eq:Ftotrace}，将迹的形式转换为F范数的形式：}
+= & \min_{S_v}\bigl\|(S_v^{-1}-\overline{S_{v,g}^{-1}}\bigr)P_v\bigr\|_F^2
+\end{align}
+当$S_v^{-1}=\overline{S_{v,g}^{-1}}$时该优化问题取得最优解为0，对应的$S_v=\overline{S_{v,g}^{-1}}^{-1}$。
+
+通过求解最小二乘问题，我们得到一个误差为0的近似，通过存储对低秩缓存$\hat{V}$的近似$XS_{v}^{-1}P_{v}=X\overline{S_{v,g}^{-1}}P_{v}$，即可实现将Value缓存从原本的$L\times d$大小压缩到$L\times r$大小，在计算注意力时再通过右乘每组对应的$Q_{v,g}$即可复原回低秩的Value近似。
+
+\subsubsection{变换矩阵$S$的计算}
+根据前文中我们的激活感知的 Key 投影低秩分解和注意力-激活感知的 Value 投影低秩分解算法，对于$W_k$的变换矩阵$S_k$需要对激活值$X^\top X$计算cholesky分解得到，对于$W_v$的变换矩阵$S_{v,g}$需要对每个注意力组的$\sum_{h=1}^H\bigl[X^\top A_{g,h}^\top A_{g,h} X \bigr]$进行cholesky分解得到。因此在计算变换矩阵并对变换后的参数矩阵进行分解之前，需要先得到激活值和注意力分数。我们采用离线校准的策略，选取一部分数据集作为校准集，让模型在这部分校准集上推理并记录激活值和注意力分数，来计算变换矩阵。
+
+为了考虑到不同语言上激活值和注意力分数的分布，使压缩之后的模型有更好的泛化性，我们选取了英文和中文数据集作为校准集计算变换矩阵。设校准集上共有$N$个样本，对于Key和Value需要进行cholesky分解的矩阵分别为$C_k$和$C_{v,g}$:
+\begin{equation}
+  C_k = \frac{1}{N}\sum_{i=1}^{N} X_i^\top X_i,\qquad
+  C_{v,g} = \frac{1}{N}\sum_{i=1}^{N}\sum_{h=1}^{H} X_i^\top A_{g,h,i}^\top A_{g,h,i} X_i.
+  \label{eq:offline_cov}
+\end{equation}
+为提升数值稳定性，我们遵循 Tikhonov 正则化做对角线平移：$C \leftarrow C + \lambda I$，其中$\lambda$由层宽度自适应设定（经验上取$10^{-4}\|C\|_F / d$）。随后对正定矩阵$C_k$和$\{C_{v,g}\}$分别执行 Cholesky 分解获得$S_k$以及$\{S_{v,g}\}$的值。
+
+
+
+%上述方法保持了 SVD 的可解释性，又充分利用推理阶段的统计特征。接下来的“层间压缩率分配方案”节将给出在已有本章推导出的变换矩阵和分解目标基础上，如何在不同层间分配秩预算、动态调节 Key/Value 压缩比的策略，从而在整体显存约束下获得最优的精度-成本折中。
+% ===== End: methdology1 =====
+
+
+% ===== Begin: methdology2 =====
+\section{迭代式层间压缩率分配策略}
+\label{chap:rank_search}
+上一节我们已经给出了注意力和激活值感知的低秩分解算法，能够在每一层内部找到与推理过程中间值 $XW_k$、$A X W_v$ 理论最优的低秩近似。本节在此基础上进一步解决“在总压缩率固定的情况下，每一层应该保留多少秩”这一跨层压缩率分配问题：\textcolor{red}{}由于不同层的重要程度，如对压缩的敏感性导致压缩当前层带来的误差、压缩误差在后续层间传播带来的误差累积不同，所有层采用统一的压缩率是欠优的。并且现有的低秩KV压缩方法在分配目标层的秩时，通常保持其余层处于未压缩状态。这导致模型的实际压缩率与预设目标压缩率存在显著偏差，且各层的秩保留情况会相互干扰，影响对目标层重要性的评估，在秩分配过程中更容易陷入局部最优，导致模型压缩后精度下降仍然较大。为了解决此前方法在层间秩分配上存在的问题，本节提出的秩分配算法考虑到了其他层压缩程度对目标层重要程度的影响，在模型整体压缩率等于目标压缩率下考虑目标层对压缩的敏感性和误差累积。进行KV特征维压缩的先决条件在于KV的低秩性，因此本研究首先根据各层KV的低秩性和目标整体压缩率对每层的秩分配进行初始化，再根据模型在其余层处于压缩状态时，压缩目标层导致的端到端的输出变化来量化衡量当前该层的重要程度。这种衡量重要程度的方式能够同时考虑到目标层对压缩的敏感性带来的压缩前后输出变化大小以及压缩导致的误差在后续层中传播时带来的误差累积。%因此我们的压缩率分配策略同时建模（1）分解目标自身的低秩性，刻画该层在 SVD 下主能量的集中程度；（2）对丢弃秩的敏感性，评估不同层的Key/Value在压缩丢弃秩之后对模型表现的影响强弱；（3）多层串联时低秩近似误差的累积风险，确保不同层段的低秩近似误差不会在向深层传播的过程中过度放大。
+
+\textcolor{red}{}我们通过低秩性在全模型秩预算约束下（由模型KV缓存总压缩率计算）对每层保留的秩进行先验分配，并根据压缩每层导致的模型端到端输出变化衡量每一层在当前秩分配下的重要性与其分配的秩数量之间的不匹配程度，运行一个逐步迭代的贪心分配算法不断更新每层的Key和Value的秩以不断减小当前模型压缩状态下每一层秩分配数量与其实际重要程度的差异。算法在考虑到不同层对秩变化敏感性的前提下不断减少压缩带来的模型精度损失，在压缩率固定情况下控制全局误差尽可能小。接下本节来将从每层秩的初始化，迭代分配更新策略两个角度来展开层间秩分配的具体流程。
+
+
+\subsection{基于参数低秩性的层间秩初始化}
+通过分解参数矩阵存储中间值的范式来进行KV缓存压缩的前提条件是所分解的目标矩阵本身呈现低秩的特性。在章节~\ref{chap:scaling_svd}中已经介绍过我们分解的目标不再是原本的参数矩阵$W_k$、$W_v$，而是通过变换矩阵$S_k$、$\bigl[S_{v,1},...S_{v,G}\bigr]$吸收了激活值和注意力统计之后的$S_kW_k$、$\bigl[S_{v,1}W_{v,1},...S_{v,G}W_{v,G}\bigr]$。只有当这些经变换的矩阵在联合 SVD 下仍表现出主奇异值快速衰减时，后续基于奇异值能量的层间 rank 初始化和动态裁剪才具备意义。图~\ref{fig:energy_key}和图~\ref{fig:energy_value}分别展示了Llama3.1-8B-Instruct\cite{dubey2024llama}的参数在使用变换矩阵进行变换之后，模型第0层的$S_kW_k$和第31层的$\bigl[S_{v,1}W_{v,1}, ...,S_{v,G}W_{v,G}\bigr]$的累积奇异值能量占比情况。横轴按照奇异值最大的秩到奇异值最小的秩排列，纵轴表示前$r$个秩的累积奇异值能量占分解目标矩阵的总奇异值能量的比例。
+
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{singular_values_energy_model_layers_0_self_attn_k_proj.png}
+    \caption{Llama3.1-8B-Instruct第0层$S_kW_k$的累积奇异值能量占比}
+    \label{fig:energy_key}
+\end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{singular_values_energy_model_layers_31_self_attn_v_proj.png}
+    \caption{Llama3.1-8B-Instruct第31层$\bigl[S_{v,1}W_{v,1},...S_{v,G}W_{v,G}\bigr]$的累积奇异值能量占比}
+    \label{fig:energy_value}
+\end{figure}
+
+从图中的累积奇异值能量占比情况可以发现模型第0层经过变换后的参数矩阵$S_kW_k$和第31层经过变换后的参数矩阵$\bigl[S_{v,1}W_{v,1},...S_{v,G}W_{v,G}\bigr]$的主要奇异值能量集中在前少数秩上：曲线在前段迅速上升，很快就达到 80\% 以上的能量占比，之后能量占比进入缓慢上升阶段，长尾部分贡献的能量极小。并且这种现象对于Key缓存的$S_kW_k$来说尤其明显，极少部分的奇异值能量占比就已经超过了90\%，说明Key本身的低秩性比Value更好。这现象在不同大模型，不同层中普遍存在。“前高后低”的累积能量特征表明经过”激活值-注意力感知“变换后的KV参数矩阵具有低秩性，只需要保留少量主奇异向量就能覆盖绝大多数能量，为后续的低秩压缩提供了基础。
+
+虽然奇异值能量集中的低秩性质在不同模型的各层之间普遍存在，但是不同层的这种能量集中性也有一定差异，并且Key的能量相比Value更加集中在很少一部分秩上。而这种层间的，Key和Value之间的低秩性差异，可以成为我们对每层的KV分解对象分配不同的保留的秩数量的先验指导，比如奇异值能量越集中的层可以分配越少的秩，Key可以比Value分配更少的秩。下面我们将具体介绍我们根据KV低秩性的秩分配初始化方法。
+
+设模型共有 $L$ 个注意力层，每一层在 GQA 架构下含有 $G$ 个 KV 组，每组的 Key/Value 特征维度均为 $d$ ，推理缓存长度为 $T$。在不压缩的情况下，模型所有层一次写入 KV 缓存的体积为
+\begin{equation}
+    \label{eq:kv-cost}
+    \mathcal{C}^{\text{KV}} = 2L \cdot T \cdot G \cdot d,
+\end{equation}
+由于进行变换之后的参数矩阵$W_k$和$W_v$的输出特征维度与SVD之后存储中间值在不丢弃秩的情况下的特征维度是一致的，都为$d$，所以$\mathcal{C}^{\text{KV}}$也是模型最多可使用的秩总数。若全模型目标压缩率为 $\rho \in (0,1]$，所有层剩余的秩之和需控制在 $(1-\rho) \cdot \mathcal{C}^{\text{KV}}$ 以内。
+
+为了在这一约束下给每层分配初值，我们先对上一章构造的“激活/注意力重加权”矩阵用新的符号进行描述：
+\begin{align}
+    &M_{k,l}=S_{k,l}W_{k,l}, \\ & M_{v,l}=\bigl[ S_{v,1,l}W_{v,1,l},...S_{v,G,l}W_{v,G,l}\bigr]
+\end{align}
+其中$l$表示层数索引。当仅考虑分解目标的低秩性时来预分配每层KV的初始秩时，可以将我们的分配目标写成一个优化问题。我们分别对第 $l$ 层的 Key/Value 分解目标保留 $r_{k,l}$、$r_{v,l}$ 个奇异值，最优秩-$r$ 近似记作 $M_{k,l}^{(r_{k,l})}$、$M_{v,l}^{(r_{v,l})}$，需要求解
+\begin{equation}
+    \label{eq:opt-init}
+    \min_{\{r_{k,l}, r_{v,l}\}} \sum_{l=1}^{L}
+        \left[
+            \frac{\bigl\|M_{k,l} - M_{k,l}^{(r_{k,l})}\bigr\|_F^2}{\|M_{k,l}\|_F^2}
+          + \frac{\bigl\|M_{v,l} - M_{v,l}^{(r_{v,l})}\bigr\|_F^2}{\|M_{v,l}\|_F^2}
+        \right],
+\end{equation}
+使得
+\begin{equation}
+    \label{eq:rank-budget}
+    \sum_{l=1}^{L} \Bigl[(d - r_{k,l}) + (d - r_{v,l})\Bigr] = (1-\rho)\cdot 2 L d.
+\end{equation}
+每一项误差都除以对应矩阵的 $\|M_{k,l}\|_F^2$、$\|M_{v,l}\|_F^2$，这是为了消除不同层能量尺度差异带来的偏置；若直接比较未归一化的能量，能量更大的层即便尾部奇异值占比极小，也会因为绝对值大而被优先保留，无法实现不同层以及Key和Value之间公平的秩分配。
+
+设矩阵 $M$ 的 SVD 为 $M=U\Sigma V^\top$，$\Sigma$矩阵中第$i$个奇异值为 $\{\sigma_i\}$。则
+\begin{equation}
+    \|M\|_F^2 = \sum_i \sigma_i^2. \label{eq:frobenius-sigma}
+\end{equation}
+该结论可由~\eqref{eq:Ftotrace}（$\|M\|_F^2=\operatorname{tr}(M^\top M)$）与 $\Sigma^\top \Sigma = \operatorname{diag}(\sigma_i^2)$ 以及奇异值向量矩阵的正交性直接推出。根据Eckart–Young保证的SVD的秩-$r$近似最优性以及式子~\eqref{eq:frobenius-sigma}，可以得到式 \eqref{eq:opt-init} 的误差能直接写成低秩近似舍弃的奇异值能量之和。记 $\{\sigma_{k,l,i}\}_{i=1}^{d}$、$\{\sigma_{v,l,i}\}_{i=1}^{d}$ 为对应矩阵的降序奇异值，则其相对能量占比为
+\begin{equation}
+    \label{eq:energy-weight}
+    w_{k,l,i} = \frac{\sigma_{k,l,i}^2}{\sum_{j=1}^{d} \sigma_{k,l,j}^2}, \qquad
+    w_{v,l,i} = \frac{\sigma_{v,l,i}^2}{\sum_{j=1}^{d} \sigma_{v,l,j}^2},
+\end{equation}
+并满足 $\sum_i w_{k,l,i} = \sum_i w_{v,l,i} = 1$。于是
+\begin{align}
+    \frac{\bigl\|M_{k,l} - M_{k,l}^{(r_{k,l})}\bigr\|_F^2}{\|M_{k,l}\|_F^2}
+    = \sum_{i=r_{k,l}+1}^{d} w_{k,l,i}, \\
+    \frac{\bigl\|M_{v,l} - M_{v,l}^{(r_{v,l})}\bigr\|_F^2}{\|M_{v,l}\|_F^2}
+    = \sum_{i=r_{v,l}+1}^{d} w_{v,l,i}.
+\end{align}
+因此，问题 \eqref{eq:opt-init} 等价于在约束 \eqref{eq:rank-budget} 下最大化被保留下来的奇异值能量：
+\begin{equation}
+    \label{eq:max-energy}
+    \max_{\{r_{k,l}, r_{v,l}\}} \sum_{l=1}^{L}
+    \left(
+        \sum_{i=1}^{r_{k,l}} w_{k,l,i}
+      + \sum_{i=1}^{r_{v,l}} w_{v,l,i}
+    \right)
+    \quad \text{s.t. } \eqref{eq:rank-budget}.
+\end{equation}
+直观地，这意味着初始化时应优先保留 Key/Value 各自能量占比最高的秩，把能量最小的奇异值视为裁剪候选，直到总共丢弃 $\rho\cdot 2Ld$ 的秩。
+
+实际实现时无需显式求解 \eqref{eq:max-energy}。我们把所有 $w_{k,l,i}$、$w_{v,l,i}$ 置于同一候选集合（它们已通过各自的 $\|M\|_F^2$ 归一化，可以直接比较），按照能量从小到大依次丢弃奇异值，直至累计删除秩达到 $\rho\cdot 2Ld$。这等价于对“所有 Key/Value 奇异值能量占比”做一次全局选择：能量占比越大的秩越早被保留，能量占比最小的秩优先被裁剪。由此得到的 $\{r_{k,l}^{(0)}, r_{v,l}^{(0)}\}$ 既满足全局 rank 预算，又把层间以及 K/V 之间的低秩差异自然映射到初始配额，\textcolor{red}{}相较于此前低秩压缩KV方法的从完整模型作为起点来计算每一层应该分配的秩的数量，本文提出的秩初始化方式在后续迭代秩分配衡量每一层的重要程度时更能反应出模型各层压缩对彼此的影响，为下一节基于压缩敏感性，误差累积的秩分配更新迭代算法提供扎实起点。
+
+\subsection{基于误差累积与压缩敏感性的层间秩重分配}
+\textcolor{red}{}初始化得到的 $\{r_{k,l}^{(0)}, r_{v,l}^{(0)}\}$ 默认为各层误差彼此独立并且不考虑各层本身包含的语义信息等对压缩的敏感性。为了显式建模压缩每层KV带来的当前层的输出变化对模型精度的影响和该压缩误差在深层网络中的传递放大，我们在一部分校准集 $\mathcal{D}_\text{cal}$ 上对每一层的KV分别按当前秩分配进行压缩与不压缩该层的模型输出差异进行观测，把压缩该层导致的误差，误差累积和分解目标对秩变换敏感性纳入层间秩重分配流程。
+
+\subsubsection{校准集驱动的误差观测}
+\label{sec:dp_for_inference}
+对于每个样本 $x\in\mathcal{D}_\text{cal}$，我们逐层运行在当前层间秩分配情况下的压缩后的模型，并记录每一层的输出来作为下一层的输入（最后一层的输出即为模型的最终输出）。当样本前向到$l$层时，我们对$l$层复制两次，记为$l_k$层和$l_v$层。对于$l_k$层我们保持$\bigl[S_{v,1}W_{v,1},...S_{v,G}W_{v,G}\bigr]$分配到的秩不变，而对于$S_kW_k$则是还原回原本的$d$个秩，即$l_k$层是$l$层在当前模型秩分配下的只压缩Value不压缩Key的版本。类似地，我们对$l_v$层保持$S_kW_k$分配的秩不变，将$\bigl[S_{v,1}W_{v,1},...S_{v,G}W_{v,G}\bigr]$分配的秩还原回$d$，就得到了$l$层只压缩Key不压缩Value的版本。
+
+对于每一层都进行这样的操作，如果模型总共有$L$层，则相当于得到了$2L+1$个不同的模型，其中1表示当前秩分配下的原本模型，而$2L$表示每一层的Key/Value分别不进行压缩，其他层的所有Key和Value以及当前层的Value/Key都保留当前秩分配时候的模型。我们将得到的这$2L$个模型的输出与原本秩分配下模型的输出进行对比，计算L2范数。L2范数越大说明压缩该层对模型输出的影响越大，造成的误差累积以及压缩该层本身的影响的共同作用越大，因此需要给这样的层分配更多的秩。反之则可以分配更少的秩，并将多出来的秩分配给其他层。但如果对每个样本都用$2L+1$个模型去进行前向得到$2L+1$个输出速度会很慢，为了解决这个问题本文提出了一个动态规划的思路在达到同样目的的情况下提升效率。
+
+记第$l$层为$F_{l}()$，$l_k$层和$l_v$层分别为$F_{l,k}()$和$F_{l,v}()$，第$l$层的输出为$h_l$，$l_k$层和$l_v$层的输出分别为$h_{l,k}$和$h_{l,v}$。动态规划算法具体做法是：维护一个队列$\mathcal{Q}$，以第0层为例，当样本$x$输入时，分别记录$F_{0}(x)=h_0$、$F_{0,k}(x)=h_{0,k}$、$F_{0,v}(x)=h_{0,v}$，并将$h_{0,k}$和$h_{0,v}$输入队列$\mathcal{Q}$中。当前向推理进行到第1层时，计算压缩了KV的输出$F_{1}(h_0)=h_1$，并将队列中的$h_{0,k}$和$h_{0,v}$依次从队首出队，每有一个出队的元素，就将出队的元素作为输入送入1层的$F_{1}()$中，最后计算得到$F_{1}(h_{0,k})$，$F_{1}(h_{0,v})$，将其作为新的$h_{0,k}$和$h_{0,v}$再从队列尾部入队。除了队列中的元素外，还将上一层的输出$h_{0}$输入给当前层（即第1层）K和V分别不压缩的变体，得到$h_{1,k}=F_{1,k}(h_0)$，$h_{1,v}=F_{1,v}(h_0)$，并将它们在$h_{0,k}$和$h_{0,v}$之后入队。一般地，对于前向推理到第$l$层时，先计算压缩KV的$l$层的输出$h_l=F_{l}(h_{l-1})$；此时队列中的元素为$\bigl[ h_{0,k},h_{0,v},...,h_{l-1,k},h_{l-1,v}\bigr]$，将各组元素（同一层的KV看作一组）依次从队首出队，第$i$组元素($0 \le i \le l-1$)为$h_{i,k}$和$h_{i,v}$，计算$F_{l}(h_{i,k})$和$F_{l}(h_{i,v})$作为新的$h_{i,k}$和$h_{i,v}$再从队尾入队，直到队列中原本的$l$组元素都经过了这样出队->计算->入队的过程。其代表的含义是第$i$层的K/V不压缩时，其输出经过第$l$层之后的输出；最后还需要计算第$l$层的K/V不压缩时的$h_{l,k}=F_{l,k}(h_{l-1})$和$h_{l,v}=F_{l,v}(h_{l-1})$，并放入队列末尾。当该过程进行到最后一层时，队列中会有$2L$个元素，分别代表模型各个层的K/V不压缩，其他层的K/V和当前层的V/K按照当前秩分配进行压缩的情况下，模型最终的输出。再加上所有层的KV都按照当前的秩分配进行压缩得到的输出，我们一共会得到$2L+1$个输出。这个算法避免了用$2L+1$个不同模型都进行一次前向推理带来的更多耗时，得到了与其同样的效果。算法的伪代码为~\ref{alg:dp-calibration}。
+
+
+\begin{algorithm}[htbp]
+\caption{动态规划式单层解压前向}
+\label{alg:dp-calibration}
+\KwIn{样本 $x$；层数 $L$；压缩映射 $\{F_l\}$；Key 解压映射 $\{F_{l,k}\}$；Value 解压映射 $\{F_{l,v}\}$}
+\KwOut{压缩模型输出 $y^{\text{full}}$ 及各层单侧解压结果 $\{y^{(k,l)}, y^{(v,l)}\}_{l=0}^{L-1}$}
+\BlankLine
+$\mathcal{Q} \gets \varnothing$ \tcp*{队列保存 $(h_{i,k}, h_{i,v})$ 成对元素}
+$h_0 \gets F_0(x)$； $h_{0,k} \gets F_{0,k}(x)$； $h_{0,v} \gets F_{0,v}(x)$；\\
+$\mathcal{Q}.\mathrm{enqueue}(h_{0,k}, h_{0,v})$；
+\BlankLine
+\For{$l \gets 1$ \KwTo $L-1$}{
+    $h_l \gets F_l(h_{l-1})$ \tcp*{压缩路径输出}
+    \For{$i \gets 0$ \KwTo $l-1$}{
+        $(\tilde{h}_{i,k}, \tilde{h}_{i,v}) \gets \mathcal{Q}.\mathrm{dequeue}()$；\\
+        $\tilde{h}_{i,k} \gets F_l(\tilde{h}_{i,k})$； $\tilde{h}_{i,v} \gets F_l(\tilde{h}_{i,v})$；\\
+        $\mathcal{Q}.\mathrm{enqueue}(\tilde{h}_{i,k}, \tilde{h}_{i,v})$；
+    }
+    $h_{l,k} \gets F_{l,k}(h_{l-1})$； $h_{l,v} \gets F_{l,v}(h_{l-1})$；\\
+    $\mathcal{Q}.\mathrm{enqueue}(h_{l,k}, h_{l,v})$；
+}
+$y^{\text{full}} \gets h_{L-1}$；\\
+\For{$l \gets 0$ \KwTo $L-1$}{
+    $(y^{(k,l)}, y^{(v,l)}) \gets \mathcal{Q}[l]$；
+}
+\Return $y=h_{L-1}, \{y^{(k,l)}, y^{(v,l)}\}_{l=0}^{L-1}$；
+\end{algorithm}
+
+在得到了$2L$个$y^{(k,i)}$、$y^{(v,i)}$，分别对它们与$y$计算L2范数，$L2_{l,k}$和$L2_{l,v}$分别表示第$l$层的K/V不压缩时模型的输出和所有层的KV都按照当前秩分配进行压缩时模型的输出之间的L2范数差异，表示当前秩分配下压缩第$l$层的K/V引起的误差和导致的层间传递误差累积共同作用下对模型输出的影响。为了结果具有更好的泛化性，我们对所有样本计算的L2范数求和作为最终的判断指标，L2范数之和越大说明当前层的K/V分配的秩过少，引起的误差过大，应该分配更多的秩；L2范数之和越小说明当前层的K/V分配的秩比较足够，可以进一步压缩，将自己的秩分出一部分给其他压缩得较多的层。
+
+\iffalse
+\subsubsection{关注高注意力词元的 L2 评估}
+注意力矩阵本身具有稀疏性，如图~\ref{fig:tmp}所示，每一个词元主要关注的只在其所有前序词元中占一小部分，真正主导各层输出的往往是少量高权重词元。若对所有词元一视同仁地计算 L2，容易让长尾词元的噪声掩盖关键差异。因此我们在统计 $L2_{l,k}$、$L2_{l,v}$ 时仅保留注意力得分排名前 $M$ 的词元（将每个注意力组的注意力求和后选取其中Top-$M$的词元），只计算这些词元在补压缩模型与各个层K/V压缩的分支模型之间的 L2误差作为层级误差。这样既把注意力稀疏性编码进评估过程，又能更准确地捕捉“对模型输出真正重要的词元上，压缩带来的偏差”。实践中我们对每个注意力组的所有词元注意力求和并选出高关注词元集合 $\mathcal{T}_{l}$，然后对 $y$、$y^{(k,l)}$、$y^{(v,l)}$ 在 $\cup_l \mathcal{T}_{l}$ 上进行 L2 比较，从而得到更加鲁棒的层级指标。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{attention_scores.png}
+    \caption{注意力的稀疏性}
+    \label{fig:tmp}
+\end{figure}
+\fi
+
+\subsubsection{误差驱动与层敏感性调控的秩重分配}
+在当前秩分配下定义第$l$层的K/V平均敏感性
+\begin{align}
+     g_{k,l}=\frac{\overline{\Delta}_{k,l}}{d-r_{k,l}}, \\
+    g_{v,l}=\frac{\overline{\Delta}_{v,l}}{d-r_{v,l}},
+\end{align}
+其中$\overline{\Delta}_{k,l}$表示所有样本在第$l$层Key不压缩的情况下模型的输出与当前秩分配下模型的输出之间的L2范数误差的均值，其中$\overline{\Delta}_{v,l}$表示所有样本在第$l$层Value不压缩的情况下模型的输出与当前秩分配下模型的输出之间的L2范数误差的均值。$g$ 描述了“单位秩变化”在该层的KV上带来的平均 L2 误差，代表L2误差对秩变化的平均梯度，越大说明该层对 rank 调整越敏感，增加或减少相同数量的秩会对模型输出的变化有越大的影响。其他所有KV不变，仅改变当前层的K/V的秩时，模型输出的变化（用校准集样本作为输入的L2范数之和衡量）如图~\ref{fig:l2_metric_curve}所示。
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/l2_metric_curve.png}
+    \caption{压缩导致的L2误差与秩变化关系}
+    \label{fig:l2_metric_curve}
+\end{figure}
+
+
+令 $\overline{\Delta}_k$/$\overline{\Delta}_v$ 为当前秩分配下所有层的K/V压缩导致的误差的均值，使用
+\begin{align}
+    \alpha_{k,l}=\frac{d/\overline{\Delta}_k}{g_{k,l}}, \\
+    \alpha_{v,l}=\frac{d/\overline{\Delta}_v}{g_{v,l}}
+\end{align}
+对敏感性$g$取倒数后进行归一化，便于定量分析如何根据K/V对秩变化的敏感性来计算每次秩重分配时候的步长。对于压缩丢弃了过多秩的层的K/V，$\alpha_{k,l}$/$\alpha_{v,l}$越大说明需要给该K/V分配更多的秩才能使其压缩后引起模型精度下降更小，模型输出的变化才能在一个合理的范围内，$\alpha_{k,l}$/$\alpha_{v,l}$越小说明给该层K/V再增加较少的秩就可以大幅减少压缩后引起的误差；类似地，对于仍然可以贡献自己一部分秩给其他层的K/V，$\alpha_{k,l}$/$\alpha_{v,l}$越大说明该层的K/V不太敏感，可以给其他层的K/V提供更多的秩，并且模型表现也不会下降太多，$\alpha_{k,l}$/$\alpha_{v,l}$越小说明虽然该层的K/V可以贡献自己的秩给其他层的K/V，但能够给出的秩数量有限，否则也会引起模型表现下降过多。
+
+在每一轮秩重分配得迭代过程中，对于Key和Value我们分别找到L2范数最大的层$\ell_{k,\text{max}}$、$\ell_{v,\text{max}}$和最小的层$\ell_{k,\text{min}}$、$\ell_{v,\text{min}}$，将L2范数最小的层的秩分一部分给L2范数最大的层。设置步长：
+\begin{align}
+    \delta_k = \eta\bigl(\alpha_{\ell_{k,\text{max}}}+\alpha_{\ell_{k,\text{min}}}\bigr)\cdot r_{\ell_{k,\text{min}}}, \\
+    \delta_v = \eta\bigl(\alpha_{\ell_{v,\text{max}}}+\alpha_{\ell_{v,\text{min}}}\bigr)\cdot r_{\ell_{v,\text{min}}}
+\end{align}
+    
+
+其中 $\eta$ 为学习率。通过 $r_{\ell_{k,\text{max}}}\leftarrow r_{\ell_{k,\text{max}}}+\delta$、$r_{\ell_{k,\text{min}}}\leftarrow r_{\ell_{k,\text{min}}}-\delta$ 、$r_{\ell_{v,\text{max}}}\leftarrow r_{\ell_{v,\text{max}}}+\delta$、$r_{\ell_{v,\text{min}}}\leftarrow r_{\ell_{v,\text{min}}}-\delta$ 完成一次 rank 传递，并在新的秩配置下重新运行校准。为了避免震荡，我们在实践中还会设置最小/最大步长、并且防止变化后的秩小于1或大于$d$；我们在每轮重分配之后计算不压缩KV的情况下模型在校准集上的输出与按重分配的秩压缩后模型在校准集上的输出之间的差异，与上一轮的该差异对比来判断该轮的重分配有没有让模型的效果在总压缩率固定的情况下更好。若连续 $K$ 轮迭代都未降低“压缩模型 vs.~完整模型”的 L2 误差，则回滚至最佳秩配置（压缩模型与完整模型输出的L2范数最小的配置）并终止循环。当迭代次数超过了预设的最大次数时，也终止循环。
+
+\subsubsection{实现细节与复杂度分析}
+该贪心策略的开销主要来自两部分：校准前向与秩重分配计算。若校准集包含 $|\mathcal{D}_\text{cal}|$ 个样本，在使用了\ref{sec:dp_for_inference}章节中的动态规划算法后，单次迭代的耗时大约为一次前向模型推理的($L+2$)倍。这是因为对第$i$层，要对当前队列总的所有元素进行计算，次数为$2i$，还需要计算一次$F_{l}(h_{l-1})$，$F_{l,k}(h_{l-1})$和$F_{l,v}(h_{l-1})$，即每层一共需要计算$2i+3$次单层推理。从0层到$L-1$层一共需要计算 $\sum_{i=0}^{L-1}(2i+3)=L^2+2L$，单个模型一共需要进行$L$次层前向，相除之后得到($L+2$)倍。虽然用了动态规划算法，当校准集样本数量较多时迭代过程仍然比较耗时。但我们在实验中发现使用少量样本和用更多的样本相比迭代算法重分配秩之后模型的效果没有明显差异，这是因为每层对秩减少的敏感性以及压缩该层K/V带来的误差累积时模型本身的性质，不会随着样本不同有很大差异。因此我们可以使用少量样本来作为校准集，仍能有较好的效果，我们在实验中通常选择 $|\mathcal{D}_\text{cal}|=64\sim 128$。而在每轮迭代中，如寻找压缩K/V导致误差最大和最小的层等其他操作和模型前向相比时间可忽略。
+
+此外，算法中迭代循环的停止标准有两种：\textbf{(i)} 当连续若干次按照算法进行层间K/V秩的重新分配之后压缩后模型的输出与完整模型的输出之间的差异一直不下降，则停止迭代并将最终模型秩分配设定为，压缩后模型与完整模型输出之间差异最小的最近一次层间秩分配方式；\textbf{(ii)}当迭代次数达到预设的最大迭代次数，则停止迭代防止在校准集上过拟合。整个秩重分配算法的伪代码为\ref{alg:rank-redistribution}。
+
+\begin{algorithm}[htbp]
+\caption{敏感性引导的层间秩重分配}
+\label{alg:rank-redistribution}
+\KwIn{目标保留率 $\rho$；层数 $L$；初始秩 $\{r_{k,l}^{(0)}, r_{v,l}^{(0)}\}$；校准集 $\mathcal{D}_\text{cal}$；算子 $F_l,F_{l,k},F_{l,v}$；学习率 $\eta$；步长上下界 $\delta_{\min},\delta_{\max}$；最大迭代次数 $T_{\max}$；允许连续未提升次数 $K$}
+\KwOut{最优秩 $\{r_{k,l}^\star, r_{v,l}^\star\}$ 及对应压缩输出}
+\BlankLine
+$t \gets 0$； $c \gets 0$； $\{r_{k,l}, r_{v,l}\} \gets \{r_{k,l}^{(0)}, r_{v,l}^{(0)}\}$；\\
+计算当前秩配置下的误差 $\mathcal{E}_{\text{best}}$ 并记录 $\{r_{k,l}^\star, r_{v,l}^\star\}$；
+\BlankLine
+\While{$t < T_{\max}$ \textbf{and} $c < K$}{
+    \tcc{1. 运行算法~\ref{alg:dp-calibration} 获取各层 L2 指标}
+    \For{$x \in \mathcal{D}_\text{cal}$}{
+        $(y^{\text{full}}, \{y^{(k,l)}, y^{(v,l)}\}) \gets \text{Algorithm}~\ref{alg:dp-calibration}(x)$；\\
+        累积 $L2_{l,k} \gets L2_{l,k} + \|y^{\text{full}} - y^{(k,l)}\|_2$；\\
+        累积 $L2_{l,v} \gets L2_{l,v} + \|y^{\text{full}} - y^{(v,l)}\|_2$；
+    }
+    计算 $\overline{\Delta} \gets \mathrm{mean}_{l}(L2_{l,k} + L2_{l,v})$；
+    \tcc{2. 根据敏感性和误差选择需要转移秩的层}
+    依据前述公式计算 $g_{k,l}, g_{v,l}$ 及 $\alpha_{k,l}, \alpha_{v,l}$；\\
+    $\ell_{k,\text{max}} \gets \arg\max_l L2_{l,k}$； $\ell_{k,\text{min}} \gets \arg\min_l L2_{l,k}$；\\
+    $\ell_{v,\text{max}} \gets \arg\max_l L2_{l,v}$； $\ell_{v,\text{min}} \gets \arg\min_l L2_{l,v}$；
+    \tcc{3. 依据敏感性自适应地设置步长并更新秩}
+    $\delta_k \gets \mathrm{clip}(\eta(\alpha_{\ell_{k,\text{max}}} + \alpha_{\ell_{k,\text{min}}})\cdot r_{\ell_{k,\text{min}}}, \delta_{\min}, \delta_{\max})$；\\
+    $\delta_v \gets \mathrm{clip}(\eta(\alpha_{\ell_{v,\text{max}}} + \alpha_{\ell_{v,\text{min}}})\cdot r_{\ell_{v,\text{min}}}, \delta_{\min}, \delta_{\max})$；\\
+    $r_{\ell_{k,\text{max}}} \gets \min(d, r_{\ell_{k,\text{max}}} + \delta_k)$；\\
+    $r_{\ell_{k,\text{min}}} \gets \max(1, r_{\ell_{k,\text{min}}} - \delta_k)$；\\
+    $r_{\ell_{v,\text{max}}} \gets \min(d, r_{\ell_{v,\text{max}}} + \delta_v)$；\\
+    $r_{\ell_{v,\text{min}}} \gets \max(1, r_{\ell_{v,\text{min}}} - \delta_v)$；\\
+    若违反约束~\eqref{eq:rank-budget}，则按比例缩放差值以回到预算内；
+    \tcc{4. 评估新秩配置并决定是否接受}
+    在 $\mathcal{D}_\text{cal}$ 上重新计算 $\mathcal{E}_{\text{curr}}$；\\
+    \If{$\mathcal{E}_{\text{curr}} < \mathcal{E}_{\text{best}}$}{
+        $\mathcal{E}_{\text{best}} \gets \mathcal{E}_{\text{curr}}$；\\
+        $\{r_{k,l}^\star, r_{v,l}^\star\} \gets \{r_{k,l}, r_{v,l}\}$；\\
+        $c \gets 0$；
+    }
+    \Else{
+        $c \gets c + 1$；
+    }
+    $t \gets t + 1$；
+}
+\Return $\{r_{k,l}^\star, r_{v,l}^\star\}$ 及其对应的压缩配置；
+\end{algorithm}
+
+ 
+% ===== End: methdology2 =====
+
+
+
+% ===== Begin: methdology3 =====
+\section{低秩感知的混合精度量化压缩}
+
+\label{chap:quant_low_rank}
+\textcolor{red}{}~\ref{chap:scaling_svd}小节和~\ref{chap:rank_search}小节已经给出了本研究设计的“注意力-激活”感知的低秩分解方式以及固定压缩预算下迭代式优化的层间秩分配算法。但正如章节~\ref{chap:intro}中观察到的，Value的低秩性质与Key不同，尾部的奇异值仍然有信息贡献，对Value使用“非1即0”保留头部奇异值并丢弃尾部奇异值的压缩方式会造成信息损失，影响压缩后模型性能。因此本节提出了一种对Value的“低秩感知混合精度量化”压缩方案，与此前方法中直接丢弃Value尾部奇异值的方式不同，我们从数值精度角度使用量化的方式来对尾部奇异值进行压缩，在保留其中有用信息的同时维持Value缓存的压缩率不变。头部奇异值保留细节，尾部奇异值以“低分辨率”存储。
+
+
+
+\textcolor{red}{}
+通过低精度保留Value尾部奇异值，在同等压缩率下能够取得相比直接丢弃更少的信息损失。此外，低秩感知的混合精度量化还为特征维压缩和量化压缩两条技术路线结合提供了一种更优的新范式。之前基于低秩的特征维KV压缩方法\cite{chang2025palu}为了更高的压缩率，也尝试与量化方案结合，但只是简单地直接对存储的KV降维中间值进行量化，导致模型精度在原本的特征压缩后进一步放大。在使用低秩感知的混合精度量化将两条技术路线结合时，将头部奇异值分配更高的数值精度，尾部奇异值分配相对低的数值精度，并根据Value缓存的特征维度和量化压缩共同作用的压缩率来计算高精度和低精度奇异值数量的比例。在追求更高压缩率的场景下，将SOTA的KV量化方法通过低秩感知的混合精度量化结合到我们的“注意力感知的低秩压缩”算法中，能够在进一步压缩数据类型位宽的同时维持模型精度不下降，提高了压缩率上限。后续~\ref{chap:exp}章节的实验表明，低秩感知的混合精度量化方法相较于单一量化技术路线的SOTA方法在同样的高压缩下有更少的精度损失。除此之外，本节还提出了一种利用低精度矩阵乘法理论上提高降维后的KV缓存重建效率的方案，在硬件支持的场景下可以减少KV重建开销。
+
+
+\subsection{背景知识}
+在正式介绍我们的方法之前，为了能更清楚地描述我们是如何将量化与低秩压缩结合的，我们先对量化这一技术路线的概念，量化时常见的一些问题和常用的解决方案进行介绍。
+\subsubsection{量化基础}
+KV缓存一般以半精度浮点数的形式（FP16）存储在显存中。将其从16比特压缩到 $b$ 比特整数表示时，我们通常对每个量化单元（可对应所有词元的KV缓存、部分词元的KV缓存、单个通道（一个词元的KV缓存向量）或一个通道内的部分特征即一个组）估计一个放缩系数 $s$ 与可选的零点 $z$，使得
+\begin{equation}
+    q = \operatorname{clip}\!\left(\left\lfloor \frac{x}{s} + z \right\rceil, q_{\min}, q_{\max}\right), \qquad
+    \hat{x} = s \cdot (q - z), \label{eq:quant}
+\end{equation}
+
+其中 $x$ 与 $\hat{x}$ 分别表示原始值与反量化之后的值，$q$ 为量化后的整数值。若 $z=0$ 并强制 $q_{\min}=-q_{\max}$，即得到\textbf{对称量化}；其实现简单、硬件友好，但需要数据分布在零点附近且正负范围大致相当。相比之下，\textbf{非对称量化}允许 $z\neq 0$，通常以数据的最小值对齐零点，从而更好地覆盖偏移分布。量化还可以按照粒度进行划分，比较粗的粒度如张量粒度的量化，整个张量共用同一组放缩系数和零点；适中的粒度如词元粒度或特征粒度量化，每个词元或每个特征维度公用一组放缩系数和零点；细粒度如分组量化，一个词元内部进一步将相邻特征划分为一组，组内共享量化参数。
+
+然而，无论采用哪种策略和粒度，离群值（outlier）都会显著放大量化误差。若采用单一尺度 $s$ 覆盖所有值，少量幅值巨大的 KV 元素会迫使尺度增大，从而让绝大多数常规值落在更粗的量化间隔内，最终抬高模型困惑度；而离群值中本身可能包含较重要的信息，若强行截断离群值，也会造成信息的损失。下面举一个例子来说明离群值的影响：比如量化目标为8比特的INT8数据类型，在没有离群值的情况下向量[0.68,  0.75,  0.81,  0.94]根据计算会量化到[91,  101,  109,  127] ；如果最后一个值是离群值，比如[0.68,  0.77,  0.81,  9.72]就会被量化到[8,  10,  10,  127]，可以看到离群值的存在让本身差异较大的前三个元素在量化后变得几乎没有差异了。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/outlier.png}
+    \caption{KV缓存离群值分布}
+    \label{fig:outliers}
+\end{figure}
+
+图~\ref{fig:outliers} 展示了我们在实际 KV 缓存中观测到的离群值现象。图中以Key缓存为例，Hidden这一轴表示低秩压缩后Key缓存的特征维度，Seqlen这一轴表示词元的序列维度。从特征维度的角度看，少部分特征维度的绝对值远高于其余特征维度；从序列维度的角度看（即逐个词元），同一词元的特征维度存在明显的离群值现象，这也是通常粗粒度量化（如矩阵粒度）量化效果退化更验证的原因之一。通过结合细粒度划分（如特征粒度）与混合精度策略能够一定程度上抑制离群带来的损失。除此之外，现有的一些方法也提出了对量化目标矩阵进行矩阵变换消除离群值之后再进行量化，并对量化后的矩阵反量化，再进行反变换的方式来消除离群值影响，这种方法同样可以应用到我们的场景下。
+
+\subsubsection{Hadamard 变换与离群抑制}
+为缓解离群幅值导致的动态范围膨胀，上述提到的矩阵变换中一类常见手段是在量化前施加 Hadamard 变换，最早在\cite{ashkboos2024quarot}中被用来消除量化模型参数时的离群值。Hadamard 矩阵 $H_n\in\{\pm 1\}^{n\times n}$ 是一族正交矩阵，满足 $H_n H_n^\top = n I$，其变换可通过快速 Walsh–Hadamard 变换（FWHT）在 $O(n\log n)$ 时间内完成，不涉及乘法，仅需加减法与轻量的缩放。我们对单个量化单元的向量 $x\in\mathbb{R}^n$ 施加标准化后的变换
+\begin{equation}
+  \tilde{x} = \frac{1}{\sqrt{n}} H_n x,  
+\end{equation}
+然后在 $\tilde{x}$ 空间执行量化。由于 Hadamard 变换实质上把每一维度投影到 $\pm 1$ 组合的正交基上，原本集中于少数维度的能量会被“打散”至各通道，极大地降低单个维度的峰度（kurtosis），从而使可用的量化尺度更贴近大多数数值。反量化时只需要在反量化后施加同样的 Hadamard（其自身就是逆变换），即可还原到原始基底。
+
+典型的 Hadamard 矩阵阶数为 $2^k$。例如，
+\begin{equation}
+    H_1 = [1],\qquad
+H_2 = \begin{bmatrix}
+1 & 1 \\
+1 & -1
+\end{bmatrix},\qquad
+H_4 = \begin{bmatrix}
+1 & 1 & 1 & 1 \\
+1 & -1 & 1 & -1 \\
+1 & 1 & -1 & -1 \\
+1 & -1 & -1 & 1
+\end{bmatrix},
+\end{equation}
+更高阶矩阵可递归构造 $H_{2n} = \begin{bmatrix} H_n & H_n \\ H_n & -H_n \end{bmatrix}$。这些 $\pm1$ 结构使得 FWHT 仅需加减法即可完成正交变换，实现起来也比较高效。
+
+尽管 Hadamard 变换无法完全消除异常值，它显著降低了极端值对量化尺度的牵制，对量化目标执行 FWHT，可在可接受的算力成本下换取更平滑的值分布。虽然 Hadamard 变换会带来额外的访存与延迟开销，但我们可以将Hadamard矩阵融合到静态的模型参数中来消除额外开销，这些实现细节将在后续方法部分讨论。
+
+
+\subsection{低秩感知的混合精度量化}
+不仅Key和Value存在低秩性差异，从图~\ref{fig:energy_key}和图~\ref{fig:energy_value}中可以观察到，前文提出的算法中K和V的分解目标$S_kW_k$和$\bigl[S_{v,1}W_{v,1},...S_{v,G}W_{v,G}\bigr]$的低秩性也存在着和KV类似的不同。Key的长尾奇异值几乎不会对总信息量产生贡献，而Value的尾部奇异值仍然使得累积奇异值能量占比不断上升。因此对于Value直接丢弃能量占比最小的秩的做法可能造成有用信息的损失。为此我们提出了低秩感知的混合精度量化方案来减少“非1即0”的丢弃式压缩方式对模型精度的损害，通过更低的精度来“低分辨率”存储尾部奇异值，全精度存储头部奇异值来保留其细节。为了维持压缩率不变，需要根据每一层Value分配到的压缩率来计算保留全精度和头部奇异值和低精度尾部奇异值数量的比例。我们在结合特征维度压缩和量化压缩时，由于Key具有更好的低秩性，因此对其压缩的方式和此前方法相同：直接量化压缩特征降维后存储的Key中间值的数据类型；对于Value缓存则是使用低秩感知的混合精度量化压缩将头部和尾部的奇异值都进行量化，头部使用更高的精度而尾部使用低精度。相较于取代“非1即0”的丢弃压缩方式（头部奇异值全精度，尾部低精度），“低秩特征降维+量化”是低秩感知的混合精度量化更泛化的应用场景，因此我们在本节主要介绍在“低秩特征降维+量化”场景下如何应用低秩感知的混合精度量化压缩，在单独特征维压缩场景下也是类似的。
+
+
+对于Key缓存的压缩，我们保留使用~\ref{chap:scaling_svd}和~\ref{chap:rank_search}中秩分配算法得到的低秩裁剪结果。若原始维度为$d$，压缩后每层保留$r_{k,l}$个秩，其空间占用约为原始的一部分，定义低秩保留率（1-压缩率）为$\rho_1 = r_{k,l}/d$。在该基础上，我们先以16比特精度存储压缩后的中间值，以保证Key主奇异向量的能量基本无损；随后进一步将这部分数据量化到更低的$b$比特，例如8比特或4比特，使量化保留率达到$\rho_2 = b/16$。最终Key侧的每一层的保留率可写成$\rho_1 \cdot \rho_2$：其中$\rho_1$来自低秩裁剪带来的特征维降维，$\rho_2$来自位宽压缩。若对所有层求平均，则得到模型级别Key缓存的整体保留率：
+\begin{equation}
+{\rho}_{\text{key}}=\frac{1}{L}\sum_{l=1}^{L} \rho_{1,l}\rho_{2,l}    
+\end{equation}
+由于Key的尾部能量极低的奇异值，直接将其舍弃并不会对模型效果有很大影响，因此我们只对原本低秩压缩保留的奇异值和奇异向量计算的Key缓存进行了量化，其他奇异值对应的特征维度则直接丢弃。
+
+在量化前进一步抑制Key缓存中的离群值时，我们使用 Palu\cite{chang2025palu} 中的方式，将 Hadamard 变换直接融入到线性投影中。设原始投影矩阵$S_k^{-1}S_kW_k$按低秩分解写作$S_k^{-1}S_kW_k = (S_k^{-1}P_k)Q_k$，我们存储的参数矩阵由原本的$W_k$变为了$S_k^{-1}P_k$和$Q_k$，其中$S_k^{-1}P_k\in\mathbb{R}^{d_{\text{in}}\times r}$、$Q_k\in\mathbb{R}^{r\times d_{\text{out}}}$，推理时缓存的是中间值$XS_k^{-1}P_k$。我们将Hadamard矩阵$H$吸收到前半部分，使得新的前向为$X (S_k^{-1}P_k)' = X (S_k^{-1}P_k H)$；相应地，把$H^{-1}$（在Hadamard情形下等同于$H^\top / r$）折叠进后半部分$Q_k' = H^{-1} Q_k$。如此一来，在线计算得到的中间值$X (S_k^{-1}P_k)'$在产生时就已经过Hadamard变换，天然具备离群值较少的特性，因而可以直接进行量化；反量化之后无需额外施加逆变换，只需与预处理过的$Q_k'$相乘即可还原原始投影效果：
+\begin{equation}
+    W_k \approx (S_k^{-1}P_k)Q_k = (S_k^{-1}P_k H)(H^\top Q_k) = (S_k^{-1}P_k)'(Q_k)'
+\end{equation}
+这种“线性层融合变换”的做法省去了在线Hadamard变换的额外成本，也缓解了Key缓存量化时离群值的问题，与 Palu的实现保持一致。
+
+正如前文所说，Value缓存长尾的奇异值虽然能量较少，但仍存在有用信息，直接将低能量奇异值丢弃仍然可能损失部分重要信息，因此我们提出了低秩感知的混合精度量化对Value缓存进行压缩：使用全精度保存头部奇异值，使用低精度保存尾部奇异值。而在“特征压缩+量化压缩”结合的场景下，还需要进一步对头部奇异值和尾部奇异值的数值精度进行压缩。比如原本特征维度压缩时，低秩感知的混合精度量化方法对Value的头部奇异值使用16比特，尾部奇异值使用8比特，在为了更高的压缩率引入量化之后，比如在原本特征降维的基础上再压缩50\%，就需要对头部奇异值使用8比特，尾部奇异值使用4比特。而由于 Value 每层的保留秩 $r_{v,l}$ 不尽相同，为了保持应用低秩感知的混合精度量化后该层的Value缓存压缩率与特征维和量化共同作用的压缩率一致，我们动态调整高精度量化的奇异值和低精度量化的奇异值的比例。设第$l$层通过低秩压缩的方式的KV缓存保留率（1-压缩率）为$\rho_1 = r_{v,l}/d$，再量化到更低的平均$b$比特，量化的保留率为$\rho_2 = b/16$，那么该层的实际保留率为$\rho_1 \cdot \rho_2$。我们现在需要用"头部秩高精度量化，尾部秩低精度量化"的方式对$l$层达到相同的压缩率，那么就需要对高精度和低精度各自量化的秩的数量进行分配。满秩的特征维度为$d$，高精度数据类型占$b_1$比特，用于量化前$r_1$个秩，低精度数据类型占$b_2$比特，用于量化后$r2$个秩。为了保持压缩率（KV保留率）不变，需要满足：
+\begin{align}
+    (16\cdot\rho_1 \cdot \rho_2 \cdot d) & = (b_1 \cdot r_1 + b_2 \cdot r_2), \label{eq:equal_bit} \\
+    r_1 + r_2 & = d \label{eq:rank}
+\end{align}
+其中~\eqref{eq:equal_bit}表示保持"先低秩再量化"的压缩方式和"低秩性感知的混合精度量化"的压缩方式得到的KV缓存特征维度所占的比特位数相等，~\eqref{eq:rank}表示高精度量化和低精度量化的秩数量之和等于满秩的情况。
+
+由上述方程组可以解得
+\begin{align}
+    r_1 = d \cdot \frac{16 \rho_1 \rho_2 - b_2}{b_1 - b_2}, \\
+    r_2 = d \cdot \frac{b_1 - 16 \rho_1 \rho_2}{b_1 - b_2}.
+\end{align}
+为保证 $r_1,r_2$ 均为非负整数，我们在实现中会对结果进行四舍五入。如果使用分组量化的话，我们会依据组大小对$r_1,r_2$ 做少量调节。若 $b_1=8$、$b_2=4$，只要 $16\rho_1\rho_2 \in [b_2, b_1]$ 即可得到合理解，并能够在保留全部秩的前提下仍能让压缩率与原方案对齐。
+
+\textcolor{red}{}在结合“低秩特征压缩+量化压缩”时，对Value使用高精度量化头部奇异值，低精度量化尾部奇异值的低秩感知混合精度量化相较于先丢弃尾部秩再统一使用适中精度量化的优势在于：对奇异值较大的头部秩采用高精度量化能够保留其关键细节，更完整地保留头部秩所承载的主要信息；对奇异值较小的尾部信息采用低精度量化，在节省存储的同时避免了尾部秩中存在的残余有用信息被完全舍弃。高精度特征数$r_1$ 与 低精度特征数$r_2$ 的求解完全依赖于~\ref{chap:scaling_svd}和~\ref{chap:rank_search}得到的秩分配和平均目标位宽，无需额外的调优环节。后续实验章节\ref{chap:exp}会展示这个方案的效果优于"秩裁剪+统一量化"。并且其中的实验结果也能说明当使用SOTA的低精度量化方法与低秩感知的混合精度量化结合时，可以在更高的压缩率下保持模型效果，精度优于单独使用SOTA的低精度量化方法压缩模型。
+
+\subsection{量化加速低秩KV重建}
+\label{sec:quant_accelarate}
+推理时对KV的重建是基于SVD的KV特征维压缩必要的步骤，但会给模型推理带来额外的计算开销。这个开销计算复杂度用FLOPs衡量，对每个KV为$\mathcal{O}(rd)$，其中$r$为低秩分解保留的特征维度数量，$d$为原本KV完整缓存特征维度。Palu\cite{chang2025palu}中采用将KV分组的方式，将$d$分成$m$组分别分解和重建，每组内的理论上将重建开销为$\mathcal{O}(\frac{r\times d}{m^2})$，再乘$m$组，总体重建开销理论减小了$m$倍，但由于本身每组的重建需要串行而原本整体重建时并行的，因此实际节省不到$m$倍。并且分组的方式相较于整体分解重建会带来更大的低秩近似误差，为了效率牺牲了一部分精度。而本节中将给出一种理论上利用量化后低精度数据类型的特点，使用低精度矩阵乘法来提高KV重建效率的方案。
+
+对于Key/Value的重建，设序列长度为$l$，分解前完整参数矩阵$W \in \mathbb{R}^{m\times d}$，分解保留的秩数量为$r$，分解后的下投影矩阵$P \in \mathbb{R}^{m\times r}$，重建上投影矩阵$Q \in \mathbb{R}^{r \times d}$。则原本计算KV缓存的FLOPs数为$\mathcal{O}(lmd)$，分解后计算中间值低秩KV缓存+重建开销的FLOPs数为$\mathcal{O}(lmr + lrd)$，当$r$越大时开销越大。根据本研究前文中提出的算法在KV整体压缩率固定情况下分配的KV缓存秩的数量，由于Key中冗余信息更多，Key分配的秩数量要小于Value，Value的重建会带来更高的计算开销。因此我们主要考虑利用低精度数据类型优化Value的重建过程。
+
+理论上，低精度数据类型的矩阵乘法速度会快于完整KV数据类型Float16的矩阵乘法速度（比如对于INT8矩阵乘法，根据具体设备型号，矩阵大小等因素，可以达到1.5-4倍加速）。基于该特点，将原本的Float16矩阵乘法重建Value缓存的过程用低精度矩阵乘法代替是一种减小重建开销的思路。基于我们的混合精度量化方案，在使用词元级别/通道级别的量化粒度下，下面我们给出使用低精度矩阵乘法加速Value重建的设计：在量化后，存储的低精度Value缓存$\hat{V}\in \mathbb{R}^{l\times (r_1 + r_2)}$，其中$r_1$为使用高精度$b_1$比特量化的奇异值幅值大的秩对应特征维度的数量，$r_2$为使用低精度$b_2$比特量化的奇异值幅值小的秩对应特征维度的数量，满足~\eqref{eq:rank}中的$r_1 + r_2 = d$，$d$为完整特征维度数量。对于量化粒度我们采用逐个词元的token-wise对称量化，并分别对矩阵高精度和低精度的部分使用不同的量化系数$s$。将$\hat{V}$看作两个不同精度的矩阵拼接$\hat{V} = \bigl[\hat{V_1}, \hat{V_2} \bigr]$，$\hat{V_1}\in \mathbb{R}^{l\times r_1}$，$\hat{V_2}\in \mathbb{R}^{l\times r_2}$；量化之前的矩阵$V = \bigl[V_1, V_2 \bigr]$。$\hat{V_1}$的每个词元的所有特征维度共用一个量化系数$s_{1,i}\in[s_{1,1},...,s_{1,l}]$，表示$\hat{V_1}$的第$i$个词元的缩放系数，$\hat{V_2}$的每个词元的所有特征维度共用一个量化系数$s_{2,i}\in[s_{2,1},...,s_{2,l}]$，表示表示$\hat{V_2}$的第$i$个词元的缩放系数。根据~\eqref{eq:quant}中的方式计算。设反量化后的高精度量化目标矩阵为$\tilde{V_1}$，低精度量化目标矩阵为$\tilde{V_2}$，则反量化过程可以表示为：
+
+\begin{align}
+     &\tilde{V_1} = \text{diag}(\bigl[s_{1,1},...,s_{1,l}\bigr]) \cdot\hat{V_1}, \\
+      &\tilde{V_2} = \text{diag}(\bigl[s_{2,1},...,s_{2,l}\bigr]) \cdot\hat{V_2}
+\end{align}
+$\text{diag}(\bigl[s_{1,1},...,s_{1,l}\bigr])$和$\text{diag}(\bigl[s_{2,1},...,s_{2,l}\bigr])$表示使用每个词元的量化系数构建的对角矩阵。反量化过程相当于分别对$b_1$精度的$\hat{V_1}$和$b_2$精度的$\hat{V_2}$左乘对应的Float16的量化系数对角阵，结果也是Float16类型。再将两者按特征维度拼接起来即得到反量化的$\tilde{V} = \bigl[\tilde{V_1}, \tilde{V_2} \bigr]$。
+
+若按照此前方法的Value重建思路，将直接对反量化后的矩阵$\tilde{V}$乘投影矩阵$Q$进行重建，这个过程将进行一次Float16类型的矩阵乘法，即重建过程额外开销的来源。为了加速这次计算，可以将将重建矩阵$Q$也量化到$b_1$比特，并用量化后的$\hat{V}$与$\hat{Q}$先进行低精度的$b_1$比特矩阵乘法，再根据量化系数$\bigl[s_{1,1},...,s_{1,l}\bigr]$,$\bigl[s_{2,1},...,s_{2,l}\bigr]$和$\hat{Q}$的量化系数进行反量化。其中对$\hat{Q}$我们采用逐个输出维度的channel-wise对称量化，即每一列共用同一个量化系数。正如前文提到的，为了避免在线消除离群值的计算过程，我们此前已经将Hadamard变换矩阵融入了重建矩阵$Q$中，因此其中离群值现象已经被缓解，可以直接进行量化。单独对$Q$的反量化过程为：
+\begin{equation}
+   \tilde{Q} = \hat{Q}  \cdot \text{diag}(\bigl[s_{q,1},...,s_{q,d}\bigr]) 
+\end{equation}
+
+$\text{diag}(\bigl[s_{q,1},...,s_{q,d}\bigr])$表示每个输出维度的量化系数构建的对角矩阵。由于我们低秩感知的量化方法中没有丢弃秩，因此$\tilde{Q}$的输入维度即行数$r$等于其输出维度即列数$d$。由于$\hat{V_1}$与$\hat{V_2}$在与$\hat{Q}$进行低精度矩阵乘法后反量化时左乘的对角系数矩阵不同，因此需要分别进行低精度矩阵乘法再各自做反量化，最后将两个反量化结果相加。设$\hat{Q_1}$为$\hat{Q}$的前$r_1$行构成的子矩阵，$\hat{Q_2}$为$\hat{Q}$的后$r_2$行构成的子矩阵。那么整个重建结果$V_{\text{res}}$的计算方式为:
+
+\begin{align}
+    V_{\text{res}} = & \text{diag}(\bigl[s_{1,1},...,s_{1,l}\bigr])\cdot \bigl(\hat{V_1}\cdot \hat{Q_1}\bigr)_{b_1}\cdot \text{diag}(\bigl[s_{q,1},...,s_{q,d}\bigr]) + \\ & \text{diag}(\bigl[s_{2,1},...,s_{2,l}\bigr])\cdot \bigl(\hat{V_2}\cdot \hat{Q_2}\bigr)_{b_1}\cdot \text{diag}(\bigl[s_{q,1},...,s_{q,d}\bigr])
+\end{align}
+    
+其中$\bigl(\hat{V_1}\cdot \hat{Q_1}\bigr)_{b_1}$和$\bigl(\hat{V_2}\cdot \hat{Q_2}\bigr)_{b_1}$表示两次$b_1$精度的矩阵乘法，由于$\hat{Q_2}$为$b_1$精度，因此需要先对$b_2$精度的$\hat{V_2}$转为$b_1$精度再计算，但数据类型转换的耗时相对计算较少且向更高的数据类型转换不会影响$\hat{V_2}$的数值精度。两次低精度矩阵乘法以及矩阵相加总共需要的FLOPs数量为$\mathcal{O}(lr_1d+lr_2d+ld)=\mathcal{O}(l(r_1+r_2+1)d)$。其中$ld$两个结果矩阵求和的FLOPs数量。两次相乘再求和与原本重建时只做一次矩阵乘法的FLOPs$\mathcal{O}(l(r_1+r_2)d)$相比几乎没有增加，并且反量化时左/右乘对角矩阵的操作可以看作矩阵每行/列乘同一个数，计算开销相较于通常矩阵乘法较少。因此整个重建过程由于耗时最高的矩阵乘法变为了低精度计算，理论上在硬件提供低精度高效计算支持的情况下，能够加快Value重建过程的计算速度。这为优化Value缓存的重建开销提供了一种可能的思路，在后续研究中我们将尝试通过CUDA kernel/Trition等将量化，低精度矩阵乘法和反量化过程融合为一个算子来高效实现。
+
+
+
+
+
+\iffalse
+\subsection{KV特征维压缩方法小结}
+本节围绕“注意力和激活值感知的低秩 KV 缓存特征压缩”展开，从理论动机、算法推导到实现逐层展开论述，\textcolor{red}{旨在通过引入注意力的分布减少此前方法中激活值指导的低秩分解导致的模型精度下降。}在回顾 SVD 低秩近似与 GQA 架构的基础知识之后，我们强调了推理阶段真正被使用的是 $XW_k$ 与 $AXW_v$ 等复合项，因此需要在优化目标中显式纳入激活与注意力信息。
+
+对于Key的分解，我们延用了此前\cite{wangsvd,chang2025palu}的方案构造激活感知的预变换 $S_k$，并证明对 $S_kW_k$ 进行联合 SVD 能够获得与真实推理误差一致的最优低秩解；对于Value的分解，我们进一步引入注意力，考虑到GQA不同注意力组的不同注意力分布，分别对每个注意力组构造 变换矩阵$S_{v,g}$，再通过联合分解捕获跨组共享的主能量。针对多组逆变换矩阵导致的缓存膨胀问题，推导了公共 逆变换$S_v^{-1}$ 的最小二乘解，并提出基于算术平均的有效近似，使压缩后缓存大小稳定在 $L\times r$ 级别。
+
+本章的主要贡献可概括为：
+\begin{itemize}
+ \item  \textcolor{red}{对于Value的分解提出兼顾激活值与注意力分布的低秩目标函数，理论上对齐求解模型推理阶段的真实注意力输出的最优低秩近似，从而降低误差；}
+  \item \textcolor{red}{求解提出的优化问题，基于 Cholesky分解得到GQA每个注意力组对应的参数变换矩阵，采用所有注意力组联合分解的方式减少Value的信息损失；}
+  \item \textcolor{red}{通过求解最小二乘优化问题给出统一逆变换的构造方法，在不增加缓存尺寸的前提下恢复各组低秩 Value；}
+  \item \textcolor{red}{讨论离线校准集统计激活值和注意力分数的细节，为后续部署提供可行方案。}
+\end{itemize}
+\fi
+
+
+\iffalse
+\subsection{秩分配算法小结}
+本节提出了一套在全局压缩率约束下迭代式层间分配秩的完整流程：\textcolor{red}{首先以激活/注意力感知后的 Key/Value 分解目标的低秩性为依据，通过全局奇异值能量排序实现秩的初始化，为后续根据每层KV的重要程度来细化秩的分配提供了一个的起点，使目标层自身的压缩误差和后续层的误差累积能够反应出当前压缩率下其他层压缩带来的影响；随后借助校准集与动态规划式算法逐层解压推理，端到端地高效评估各层压缩导致的误差和后续层中误差传播和放大的累积影响，并结合 Top-$M$ 注意力筛选来凸显压缩对关键词元的影响；最后在整体压缩率固定的当前秩分配下，端到端地衡量给每一层分配的秩与其实际重要程度之间的差异是否导致了其低秩近似误差与误差累积过大，并根据每层KV压缩误差对秩变化的敏感性度量决定贪心迭代算法重分配秩的步长，在迭代中动态调节层间秩配额并配合多重停止准则使算法更好收敛。这一系列设计利用了~\ref{chap:scaling_svd}中变换后模型中每层Key/Value的低秩信息、对压缩的敏感性和压缩误差累积，相比于之前低秩压缩KV的层间秩分配策略，本研究考虑到了其他层压缩对目标层在整个模型中重要程度的影响，并在整体压缩率固定下动态迭代更新每层KV的秩分配不断优化模型的端到端效果，在总体秩预算固定下取得了比此前方法更少的效果模型劣化。}
+%这一系列设计为下一步整体推理加速提供了可控、精细且高效的压缩率分配机制。
+\fi
+
+
+%\subsection{小结}
+%\textcolor{red}{本章围绕低秩感知的混合精度量化方法展开。首先说明了该方法要解决的问题：Value缓存的尾部奇异值仍有信息量，我们使用量化方式将其压缩而非“非1即0”的丢弃方式，以此减少信息的损失。并在更泛化的“低秩特征压缩+量化压缩”场景下说明了低秩感知的量化方式的具体算法： Key 侧沿用此前方法中的低秩裁剪后配合 Hadamard 融合与低比特量化，Value 侧则由于能量低的奇异值仍包含一些有价值的信息且能量高的奇异值需要保留更多的细节，采用保留全部秩的混合精度量化方案进行压缩。随后，对于此前方法中低秩Value重建的较高额外开销问题，提出了一种可能的解法：对重建投影矩阵也进行量化，用理论高效的低精度数据类型矩阵乘计算混合精度存储的Value与低精度重建矩阵相乘的结果，并对结果进行反量化。整体来看，本章方法在再前一章的基础上能够在压缩率不变的情况下解决丢弃Value缓存造成精度损失问题，并且提供了一种结合低秩特征维度压缩和量化压缩的范式，能够在更高的压缩率下更好的保留模型的性能。}
+
+
+\section{本章小结}
+本章围绕我们提出的基于低秩性质的KV缓存压缩方法展开，分别介绍了我们的“注意力-激活”感知的低秩分解算法，全局压缩率约束下迭代式的层间秩分配策略和低秩感知的量化压缩方式。
+
+首先，对于“注意力-激活”感知的低秩分解算法，本章的\ref{chap:scaling_svd}小节从理论动机、算法推导到实现对其逐层展开论述，旨在通过引入注意力的分布减少此前方法中激活值指导的低秩分解导致的模型精度下降。在回顾 SVD 低秩近似与 GQA 架构的基础知识之后，我们强调了推理阶段真正被使用的是 $XW_k$ 与 $AXW_v$ 等复合项，因此需要在优化目标中显式纳入激活与注意力信息。对于Key的分解，我们延用了此前方法\cite{wangsvd,chang2025palu}构造的激活感知的变换矩阵 $S_k$和各组联合的低秩分解方式；对于Value的分解，我们进一步引入注意力，提出了兼顾激活值与注意力分布的低秩目标函数，理论上对齐求解模型推理阶段的真实注意力输出的最优低秩近似。基于 Cholesky分解得到GQA每个注意力组对应的参数变换矩阵，采用所有注意力组联合分解的方式减少Value的信息损失。通过求解最小二乘优化问题给出统一逆变换的构造方法，在不增加缓存尺寸的前提下存储低秩 Value中间值，使压缩后缓存大小稳定在 $L\times r$。我们还讨论了离线校准集统计激活值和注意力分数的细节，为后续部署提供可行方案。
+
+第二，\ref{chap:rank_search}小节详细介绍了我们迭代式的层间秩分配算法的完整流程。首先以激活/注意力感知后的 Key/Value 分解目标的低秩性为依据，通过全局奇异值能量排序实现秩的初始化，为后续根据每层KV的重要程度来细化秩的分配提供了一个的起点，使目标层自身的压缩误差和后续层的误差累积能够反应出当前压缩率下其他层压缩带来的影响；随后借助校准集与动态规划式算法逐层解压推理，端到端地高效评估各层压缩导致的误差和后续层中误差传播和放大的累积影响；最后在整体压缩率固定的当前秩分配下，端到端地衡量给每一层当前分配的秩与其实际重要程度之间的差异是否导致了模型效果劣化过大，并根据每层KV压缩误差对秩变化的敏感性度量决定贪心迭代算法重分配秩的步长，在迭代中动态调节层间秩配额并配合多重停止准则使算法更好收敛。这一系列设计利用了~\ref{chap:scaling_svd}中变换后模型中每层Key/Value的低秩信息、对压缩的敏感性和压缩误差累积，相比于之前低秩压缩KV的层间秩分配策略，我们的秩分配策略考虑到了其他层压缩对目标层在整个模型中重要程度的影响，并在整体压缩率固定下动态迭代更新每层KV的秩分配以不断优化模型的端到端效果，在总体秩预算固定下能够取得比此前方法更少的模型效果劣化。
+
+最后，\ref{chap:quant_low_rank}则围绕低秩感知的量化压缩方法展开。首先说明了该方法要解决的问题：Value缓存的尾部奇异值仍有信息量，之前方法采用的“非1即0”的尾部奇异值裁剪的方式会造成信息损失。因此我们使用量化“低分辨率”存储而非丢弃的方式对其进行压缩，以此保留Value的更多信息。并且，我们在更泛化的“低秩特征压缩+量化压缩”场景下说明了低秩感知的量化方式的具体算法： Key 侧沿用此前方法中的低秩裁剪后配合 Hadamard 融合与低比特量化，Value 侧则由于能量低的奇异值仍包含一些有价值的信息且能量高的奇异值需要保留更多的细节，采用保留全部秩的混合精度量化方案进行压缩。随后，对于此前方法中低秩Value重建的较高额外开销问题，提出了一种可能的解法：对重建投影矩阵也进行量化，用理论高效的低精度数据类型矩阵乘计算混合精度存储的Value与低精度重建矩阵相乘的结果，并对结果进行反量化。整体来看，对Value低秩感知的量化压缩在\ref{chap:scaling_svd}和\ref{chap:rank_search}小节的基础上，能够在压缩率不变的情况下解决完全丢弃Value缓存尾部奇异值造成精度损失问题，并且提供了一种结合低秩特征维度压缩和量化压缩的范式，能够在更高的压缩率下更好地保留模型的性能。
+
+
+
+
+\iffalse
+% ===== Begin: methdology3 =====
+\section{低秩感知的混合精度量化KV压缩}
+
+\label{chap:quant_low_rank}
+\textcolor{red}{~\ref{chap:scaling_svd}章节和~\ref{chap:rank_search}章节已经给出了本研究设计的低秩分解压缩KV缓存以及在固定压缩预算下层间分配秩的算法。但由于分解目标本身的低秩性也是有限的，尤其是对Value来说，当压缩率较高时若希望进一步压缩，通过继续丢弃秩的方式来实现将造成模型效果的严重劣化，这时通过其他技术路线与低秩压缩结合可以比单一技术路线在更高的压缩率下有更少的精度下降。并且由于我们存储的KV是激活$X$与下投影低秩矩阵$P$相乘得到的中间值$XP$，在推理时还需要与上投影低秩矩阵$Q$相乘，会引入额外的计算开销，在一些场景下容易达到计算瓶颈。低精度的数据类型从存储，计算的角度都比高精度数据类型有优势，并且量化压缩数据类型也与其他技术路线有着比较好的兼容性，因此本节主要聚焦于如何在低秩的场景下引入量化进行较高压缩率的压缩并缓解重建KV带来的额外计算开销。}
+
+\textcolor{red}{之前低秩压缩KV方法\cite{chang2025palu}为了更高的压缩率，将按照其算法进行低秩压缩KV后的模型进一步引入量化压缩。但由于对所有保留的秩都用统一精度压缩，忽略了奇异值幅值更大的秩包含更多信息，奇异值幅值更小的秩存在更多冗余的低秩压缩带来的特点。本节为了在低秩附加量化这一提高KV压缩率上限的技术路线上进一步减少模型压缩后的精度损失，根据SVD得到的奇异值大对应的秩和特征维度和奇异值小对应的秩的特征维度包含的信息不同，在该层压缩率固定的情况下给不同特征维度分配不同的数值精度进行量化；为了提高低秩压缩KV带来的重建开销问题，本节进一步利用低精度矩阵乘法速度更快的特点加速量化KV的重建。本节提出的低秩感知的混合精度量化KV压缩方案能够同时解决过高压缩率下低秩压缩使模型效果劣化大的问题以及低秩压缩带来的额外重建计算开销问题。}
+
+%量化压缩数据类型与其他技术路线有着比较好的兼容性，因此本节主要聚焦于如何在低秩的场景下引入量化进行较高压缩率的压缩。%这种现象在量化压缩数据类型的技术路线上也存在，比如在2bit低精度量化的KV缓存上进一步使用1bit以期更高的压缩率时，若不通过额外消耗存储（如更细粒度）或额外时间开销（如构建查询码本）也会造成更大的模型性能损失。即便是精心设计的1-2bit量化算法，
+
+%此时如果结合其他技术路线进行压缩，可以
+
+%需要与其他维度的KV缓存压缩方式结合，比如引入低比特量化。然而已有实验表明：当 Key/Value 被粗粒度（比如每个词元使用同一组量化参数）地统一压到低精度2-bit 时，模型困惑度急剧上升。而当我们提高2-bit量化的粒度，将通道粒度量化改为通道内分组粒度量化时，模型压缩后的效果会有不小的提升。表~\ref{tab:value-quant-granularity}展示了我们上面的结论，其使用的数据集WikiText-2由 Wikipedia 精选的文章段落构成，PTB为《华尔街日报》语料的精简版本，后续实验章节我们会详细介绍它们。衡量压缩后模型性能的指标为困惑度（ppl），越大说明模型性能越差。
+\iffalse
+\begin{table}[htbp]
+    \centering
+    \caption{不同量化粒度在 2-bit 下的困惑度（Perplexity）对比}
+    \label{tab:value-quant-granularity}
+    \begin{tabular}{lcc}
+        \toprule
+        \textbf{量化粒度} & \textbf{WikiText-2} & \textbf{PTB} \\
+        \midrule
+        通道级（channel-wise, 2-bit） & 514.59 & 2665.66 \\
+        分组级（group-wise, 2-bit） & 11.17 & 20.87 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+\fi
+
+%在低秩压缩后，一旦想继续将量化应用到低秩压缩的模型上，由于层与层之间保留的秩彼此不同，量化时KV缓存的特征维度就都不相同， group-wise 量化的组大小往往无法整除各层KV缓存的特征维度，导致细粒度量化难以落地。最后，即使解决了粒度问题，我们仍需在不同秩之间区别对待量化精度：低秩分解所暴露的奇异值能量差异意味着重要秩必须维持较高精度，因为其本身包含了模型的更多信息，而长尾秩（比如原本低秩压缩舍弃的部分）则可采用更低比特。如何在这三重约束下，把“粗/细粒度量化”与“混合精度、低秩感知”协同起来，构成了本章方法的出发点。
+
+\subsection{背景知识}
+在正式介绍我们的方法之前，为了能更清楚地描述我们是如何将量化与低秩压缩结合的，我们先对量化这一技术路线的概念，量化时常见的一些问题和常用的解决方案进行介绍。
+\subsubsection{量化基础}
+KV缓存一般以半精度浮点数的形式（FP16）存储在显存中。将其从16比特压缩到 $b$ 比特整数表示时，我们通常对每个量化单元（可对应所有词元的KV缓存、部分词元的KV缓存、单个通道（一个词元的KV缓存向量）或一个通道内的部分特征即一个组）估计一个放缩系数 $s$ 与可选的零点 $z$，使得
+\begin{equation}
+    q = \operatorname{clip}\!\left(\left\lfloor \frac{x}{s} + z \right\rceil, q_{\min}, q_{\max}\right), \qquad
+    \hat{x} = s \cdot (q - z), \label{eq:quant}
+\end{equation}
+
+其中 $x$ 与 $\hat{x}$ 分别表示原始值与反量化之后的值，$q$ 为量化后的整数值。若 $z=0$ 并强制 $q_{\min}=-q_{\max}$，即得到\textbf{对称量化}；其实现简单、硬件友好，但需要数据分布在零点附近且正负范围大致相当。相比之下，\textbf{非对称量化}允许 $z\neq 0$，通常以数据的最小值对齐零点，从而更好地覆盖偏移分布。量化还可以按照粒度进行划分，比较粗的粒度如张量粒度的量化，整个张量共用同一组放缩系数和零点；适中的粒度如词元粒度或特征粒度量化，每个词元或每个特征维度公用一组放缩系数和零点；细粒度如分组量化，一个词元内部进一步将相邻特征划分为一组，组内共享量化参数。
+
+然而，无论采用哪种策略和粒度，离群值（outlier）都会显著放大量化误差。若采用单一尺度 $s$ 覆盖所有值，少量幅值巨大的 KV 元素会迫使尺度增大，从而让绝大多数常规值落在更粗的量化间隔内，最终抬高模型困惑度；而离群值中本身可能包含较重要的信息，若强行截断离群值，也会造成信息的损失。下面举一个例子来说明离群值的影响：比如量化目标为8-bit的INT8数据类型，在没有离群值的情况下向量[0.68,  0.75,  0.81,  0.94]根据计算会量化到[91,  101,  109,  127] ；如果最后一个值是离群值，比如[0.68,  0.77,  0.81,  9.72]就会被量化到[8,  10,  10,  127]，可以看到离群值的存在让本身差异较大的前三个元素在量化后变得几乎没有差异了。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\linewidth]{figures/outlier.png}
+    \caption{KV缓存离群值分布}
+    \label{fig:outliers}
+\end{figure}
+
+图~\ref{fig:outliers} 展示了我们在实际 KV 缓存中观测到的离群值现象。图中以Key缓存为例，Hidden这一轴表示低秩压缩后Key缓存的特征维度，Seqlen这一轴表示词元的序列维度。从特征维度的角度看，少部分特征维度的绝对值远高于其余特征维度；从序列维度的角度看（即逐个词元），同一词元的特征维度存在明显的离群值现象，这也是通常粗粒度量化（如矩阵粒度）量化效果退化更验证的原因之一。通过结合细粒度划分（如特征粒度）与混合精度策略能够一定程度上抑制离群带来的损失。除此之外，现有的一些方法也提出了对量化目标矩阵进行矩阵变换消除离群值之后再进行量化，并对量化后的矩阵反量化，再进行反变换的方式来消除离群值影响，这种方法同样可以应用到我们的场景下。
+
+\subsubsection{Hadamard 变换与离群抑制}
+为缓解离群幅值导致的动态范围膨胀，上述提到的矩阵变换中一类常见手段是在量化前施加 Hadamard 变换，最早在\cite{ashkboos2024quarot}中被用来消除量化模型参数时的离群值。Hadamard 矩阵 $H_n\in\{\pm 1\}^{n\times n}$ 是一族正交矩阵，满足 $H_n H_n^\top = n I$，其变换可通过快速 Walsh–Hadamard 变换（FWHT）在 $O(n\log n)$ 时间内完成，不涉及乘法，仅需加减法与轻量的缩放。我们对单个量化单元的向量 $x\in\mathbb{R}^n$ 施加标准化后的变换
+\begin{equation}
+  \tilde{x} = \frac{1}{\sqrt{n}} H_n x,  
+\end{equation}
+然后在 $\tilde{x}$ 空间执行量化。由于 Hadamard 变换实质上把每一维度投影到 $\pm 1$ 组合的正交基上，原本集中于少数维度的能量会被“打散”至各通道，极大地降低单个维度的峰度（kurtosis），从而使可用的量化尺度更贴近大多数数值。反量化时只需要在反量化后施加同样的 Hadamard（其自身就是逆变换），即可还原到原始基底。
+
+典型的 Hadamard 矩阵阶数为 $2^k$。例如，
+\begin{equation}
+    H_1 = [1],\qquad
+H_2 = \begin{bmatrix}
+1 & 1 \\
+1 & -1
+\end{bmatrix},\qquad
+H_4 = \begin{bmatrix}
+1 & 1 & 1 & 1 \\
+1 & -1 & 1 & -1 \\
+1 & 1 & -1 & -1 \\
+1 & -1 & -1 & 1
+\end{bmatrix},
+\end{equation}
+更高阶矩阵可递归构造 $H_{2n} = \begin{bmatrix} H_n & H_n \\ H_n & -H_n \end{bmatrix}$。这些 $\pm1$ 结构使得 FWHT 仅需加减法即可完成正交变换，实现起来也比较高效。
+
+尽管 Hadamard 变换无法完全消除异常值，它显著降低了极端值对量化尺度的牵制，对量化目标执行 FWHT，可在可接受的算力成本下换取更平滑的值分布。虽然 Hadamard 变换会带来额外的访存与延迟开销，但我们可以将Hadamard矩阵融合到静态的模型参数中来消除额外开销，这些实现细节将在后续方法部分讨论。
+
+
+\subsection{低秩感知的混合精度量化}
+从图~\ref{fig:energy_key}和图~\ref{fig:energy_value}中可以观察到，虽然前文提出的算法中的分解目标$S_kW_k$和$\bigl[S_{v,1}W_{v,1},...S_{v,G}W_{v,G}\bigr]$都具有低秩性，即大部分能量都只集中在前几个奇异值上，但是明显能够发现Key的低秩性要更好一些，长尾的奇异值几乎不占多少能量了。因此我们认为完全丢弃能量占比最小的秩的做法，对于Key来说损失的信息是可以接受的，而对于Value来说可能造成较大的信息损失。因此在我们已经通过低秩降维的方式对模型KV缓存进行了压缩后，为了进一步结合量化压缩模型KV，我们将特征维度与量化结合时对Key和Value采用了不同的方法。
+
+对于Key缓存的压缩，我们保留使用~\ref{chap:scaling_svd}和~\ref{chap:rank_search}中秩分配算法得到的低秩裁剪结果。若原始维度为$d$，压缩后每层保留$r_{k,l}$个秩，其空间占用约为原始的一部分，定义低秩压缩率为$\rho_1 = r_{k,l}/d$（或等价的存储体积比）。在该基础上，我们先以16-bit精度存储压缩后的中间值，以保证Key主奇异向量的能量基本无损；随后进一步将这部分数据量化到更低的$b$比特，例如8-bit或4-bit，使量化压缩率达到$\rho_2 = b/16$。最终Key侧的每一层的压缩率可近似写成$\rho_1 \cdot \rho_2$：其中$\rho_1$来自低秩裁剪带来的特征维降维，$\rho_2$来自位宽压缩。若对所有层求平均，则得到模型级别Key缓存的整体压缩率：
+\begin{equation}
+{\rho}_{\text{key}}=\frac{1}{L}\sum_{l=1}^{L} \rho_{1,l}\rho_{2,l}    
+\end{equation}
+由于Key的尾部能量极低的奇异值，直接将其舍弃并不会对模型效果有很大影响，因此我们只对原本低秩压缩保留的奇异值和奇异向量计算的Key缓存进行了量化，其他奇异值对应的特征维度则直接丢弃。
+
+在量化前进一步抑制Key缓存中的离群值时，我们使用 Palu\cite{chang2025palu} 中的方式，将 Hadamard 变换直接融入到线性投影中。设原始投影矩阵$S_k^{-1}S_kW_k$按低秩分解写作$S_k^{-1}S_kW_k = (S_k^{-1}P_k)Q_k$，我们存储的参数矩阵由原本的$W_k$变为了$S_k^{-1}P_k$和$Q_k$，其中$S_k^{-1}P_k\in\mathbb{R}^{d_{\text{in}}\times r}$、$Q_k\in\mathbb{R}^{r\times d_{\text{out}}}$，推理时缓存的是中间值$XS_k^{-1}P_k$。我们将Hadamard矩阵$H$吸收到前半部分，使得新的前向为$X (S_k^{-1}P_k)' = X (S_k^{-1}P_k H)$；相应地，把$H^{-1}$（在Hadamard情形下等同于$H^\top / r$）折叠进后半部分$Q_k' = H^{-1} Q_k$。如此一来，在线计算得到的中间值$X (S_k^{-1}P_k)'$在产生时就已经过Hadamard变换，天然具备离群值较少的特性，因而可以直接进行量化；反量化之后无需额外施加逆变换，只需与预处理过的$Q_k'$相乘即可还原原始投影效果：
+\begin{equation}
+    W_k \approx (S_k^{-1}P_k)Q_k = (S_k^{-1}P_k H)(H^\top Q_k) = (S_k^{-1}P_k)'(Q_k)'
+\end{equation}
+这种“线性层融合变换”的做法省去了在线Hadamard变换的额外成本，也缓解了Key缓存量化时离群值的问题，与 Palu的实现保持一致。
+
+我们结合低秩压缩与量化的多角度压缩方式的创新点主要在Value的混合精度压缩上。前文提到，虽然对于Value缓存长尾的奇异值能量较少，提供的信息少，但相比Key缓存直接将低能量奇异值丢弃仍然可能损失部分重要信息。因此我们综合了量化和低秩降维的思路，采用“保留全部秩、按重要性分配不同数据位宽”的策略：对奇异值较大的重要秩维持较高精度（如8-bit），以保留更多信息；对长尾秩虽然保留，但使用更低比特（如4-bit）来进一步压缩，减少冗余信息占用的缓存体积。由于 Value 每层的保留秩 $r_{v,l}$ 不尽相同，为了保持混合精度量化后该层的Value缓存压缩率与”先低秩压缩特征维度，再量化数据类型“的压缩率一致，我们动态调整高精度量化的特征和低精度量化的特征的数量。设第$l$层通过低秩压缩的方式的压缩率为$\rho_1 = r_{v,l}/d$，再量化到更低的平均$b$比特，量化的压缩率为$\rho_2 = b/16$，那么该层的总压缩率为$\rho_1 \cdot \rho_2$。我们现在需要用"重要秩高精度量化，不重要秩低精度量化"的方式对$l$层达到相同的压缩率，那么就需要对高精度和低精度各自量化的秩的数量进行分配。满秩的特征维度为$d$，高精度数据类型占$b_1$比特，用于量化前$r_1$个秩，低精度数据类型占$b_2$比特，用于量化后$r2$个秩。为了保持压缩率不变，需要满足：
+\begin{align}
+    (b\cdot\rho_1 \cdot \rho_2 \cdot d)\text{-bit} & = (b_1 \cdot r_1 + b_2 \cdot r_2)\text{-bit}, \label{eq:equal_bit} \\
+    r_1 + r_2 & = d \label{eq:rank}
+\end{align}
+其中~\eqref{eq:equal_bit}表示保持"先低秩再量化"的压缩方式和"低秩性感知的混合精度量化"的压缩方式得到的KV缓存特征维度所占的比特位数相等，~\eqref{eq:rank}表示高精度量化和低精度量化的秩数量之和等于满秩的情况。
+
+由上述方程组可以解得
+\begin{align}
+    r_1 = d \cdot \frac{b \rho_1 \rho_2 - b_2}{b_1 - b_2}, \\
+    r_2 = d \cdot \frac{b_1 - b \rho_1 \rho_2}{b_1 - b_2}.
+\end{align}
+为保证 $r_1,r_2$ 均为非负整数，我们在实现中会对结果进行四舍五入，并依据组大小或并行约束做少量调节。若 $b_1=8$、$b_2=4$，只要 $b\rho_1\rho_2 \in [b_2, b_1]$ 即可得到合理解；当某层的 $b\rho_1\rho_2$ 过小（靠近纯低比特）时，我们直接令 $r_1=0$，退化为全部低精度量化，这样做在保留全部秩的前提下仍能让压缩率与原方案对齐。
+
+\textcolor{red}{对于Value的混合精度方案的优势在于：一方面高精度量化头部奇异值，低精度量化尾部奇异值，相较于先丢弃尾部秩再统一精度量化能保留尾部秩的更多信息；另一方面维持与原“秩裁剪+统一量化”相当的整体体积，因而不会增加 KV 缓存预算；并且高精度特征数$r_1$ 与 低精度特征数$r_2$ 的求解完全依赖于~\ref{chap:scaling_svd}和~\ref{chap:rank_search}得到的秩分配和平均目标位宽，无需额外的调优环节；我们仅需按层读取奇异值能量排序，确定哪些秩进入高精度集合即可。后续实验章节\ref{chap:experiment}会展示这个方案的效果优于"秩裁剪+统一量化"。}
+
+\subsection{量化加速低秩KV重建}
+\textcolor{red}{推理时对KV的重建是基于SVD的低秩KV压缩必要的步骤，但会给模型推理带来额外的计算开销，这个开销计算复杂度用FLOPs衡量，对每个KV为$\mathcal{O}(rd)$，其中$r$为低秩分解保留的特征维度数量，$d$为原本KV完整缓存特征维度。Palu\cite{chang2025Palu}中采用将KV分组的方式，将$d$分成$m$组分别分解和重建，每组内的理论上将重建开销为$\mathcal{O}(\frac{r\times d}{m^2})$，再乘$m$组，总体重建开销理论减小了$m$倍，但由于本身每组的重建需要串行而原本整体重建时并行的，因此实际节省不到$m$倍。并且分组的方式相较于整体分解重建会带来更大的低秩近似误差，相当于牺牲了一部分精度换取一部分效率。而本节中将探究如何利用量化后低精度数据类型的特点，在几乎不额外损失模型的精度的情况下提出加速重建的可能。}
+
+\textcolor{red}{对于Key/Value的重建，设序列长度为$l$，分解前完整参数矩阵$W \in \mathbb{R}^{m\times d}$，分解保留的秩数量为$r$，分解后的下投影矩阵$P \in \mathbb{R}^{m\times r}$，重建上投影矩阵$Q \in \mathbb{R}^{r \times d}$。则原本计算KV缓存的FLOPs数为$\mathcal{O}(lmd)$，分解后计算中间值低秩KV缓存+重建开销的FLOPs数为$\mathcal{O}(lmr + lrd)$，当$r$越大时开销越大。根据本研究前文中提出的算法在KV整体压缩率固定情况下分配的KV缓存秩的数量，由于Key中冗余信息更多，Key分配的秩数量要小于Value，Value的重建会带来更高的计算开销。因此我们主要考虑利用低精度数据类型优化Value的重建过程。}
+
+\textcolor{red}{理论上，低精度数据类型的矩阵乘法速度会快于完整KV数据类型Float16的矩阵乘法速度（比如对于INT8矩阵乘法，根据具体设备型号，矩阵大小等因素，可以达到1.5-4倍加速）。本研究基于该特点，将原本的Float16矩阵乘法重建Value缓存的过程用低精度矩阵乘法代替。基于我们的混合精度量化方案，下面给出我们使用低精度矩阵乘法加速Value重建的设计：在量化后，存储的低精度Value缓存$\hat{V}\in \mathbb{R}^{l\times (r_1 + r_2)}$，其中$r_1$为使用高精度$b_1-\text{bit}$量化的奇异值幅值大的秩对应特征维度的数量，$r_2$为使用低精度$b_2-\text{bit}$量化的奇异值幅值小的秩对应特征维度的数量，满足~\eqref{eq:rank}中的$r_1 + r_2 = d$，$d$为完整特征维度数量。对于量化粒度我们采用逐个词元的token-wise对称量化，并分别对矩阵高精度和低精度的部分使用不同的量化系数。将$\hat{V}$看作两个不同精度的矩阵拼接$\hat{V} = \bigl[\hat{V_1}, \hat{V_2} \bigr]$，$\hat{V_1}\in \mathbb{R}^{l\times r_1}$，$\hat{V_2}\in \mathbb{R}^{l\times r_2}$；量化之前的矩阵$V = \bigl[V_1, V_2 \bigr]$。$\hat{V_1}$的每个词元的所有特征共用一个量化系数$s_{1,i}\in[s_{1,1},...,s_{1,l}]$，$\hat{V_2}$的每个词元的所有特征共用一个量化系数$s_{2,i}\in[s_{2,1},...,s_{2,l}]$，量化系数根据~\eqref{eq:quant}中的方式计算。设反量化后的高精度量化目标矩阵为$\tilde{V_1}$，低精度量化目标矩阵为$\tilde{V_2}$，则反量化过程可以表示为：
+}
+\begin{align}
+     &\tilde{V_1} = \text{diag}(\bigl[s_{1,1},...,s_{1,l}\bigr]) \cdot\hat{V_1}, \\
+      &\tilde{V_2} = \text{diag}(\bigl[s_{2,1},...,s_{2,l}\bigr]) \cdot\hat{V_2}
+\end{align}
+\textcolor{red}{$\text{diag}(\bigl[s_{1,1},...,s_{1,l}\bigr])$和$\text{diag}(\bigl[s_{2,1},...,s_{2,l}\bigr])$表示使用每个词元的量化系数构建的对角矩阵。反量化过程相当于分别对$b_1$精度的$\hat{V_1}$和$b_2$精度的$\hat{V_2}$左乘对应的Float16的量化系数对角阵，结果也是Float16类型。再将两者按特征维度拼接起来即得到反量化的$\tilde{V} = \bigl[\tilde{V_1}, \tilde{V_2} \bigr]$}。
+
+\textcolor{red}{若按照此前方法的Value重建思路，将直接对反量化后的矩阵$\tilde{V}$乘重建矩阵$Q$，这个过程将进行一次Float16类型的矩阵乘法，即重建过程额外开销的来源。为了加速这次计算，本研究进一步将重建矩阵$Q$也量化到$b_1-\text{bit}$，并用量化后的$\hat{V}$与$\hat{Q}$先进行低精度的$b_1-\text{bit}$矩阵乘法，再根据量化系数$\bigl[s_{1,1},...,s_{1,l}\bigr]$,$\bigl[s_{2,1},...,s_{2,l}\bigr]$和$\hat{Q}$的量化系数进行反量化。其中对$\hat{Q}$我们采用逐个输出维度的channel-wise对称量化，即每一列共用同一个量化系数。正如前文提到的，为了避免在线消除离群值的计算过程，我们此前已经将Hadamard变换矩阵融入了重建矩阵$Q$中，因此其中离群值现象已经被缓解，可以直接进行量化。单独对$Q$的反量化过程为：}
+\begin{equation}
+   \tilde{Q} = \hat{Q}  \cdot \text{diag}(\bigl[s_{q,1},...,s_{q,d}\bigr]) 
+\end{equation}
+\textcolor{red}{
+$\text{diag}(\bigl[s_{q,1},...,s_{q,d}\bigr])$表示每个输出维度的量化系数构建的对角矩阵。由于我们低秩与量化结合的方法中没有丢弃秩，因此$\tilde{Q}$的输入维度即行数$r$等于其输出维度即列数$d$。由于$\hat{V_1}$与$\hat{V_2}$在与$\hat{Q}$进行低精度矩阵乘法后反量化时左乘的对角系数矩阵不同，因此需要分别进行低精度矩阵乘法。设$\hat{Q_1}$为$\hat{Q}$的前$r_1$行构成的子矩阵，$\hat{Q_2}$为$\hat{Q}$的后$r_2$行构成的子矩阵。那么整个"先低精度矩阵乘，再反量化"的结果$V$的计算方式为:
+}
+\begin{align}
+    V = & \text{diag}(\bigl[s_{1,1},...,s_{1,l}\bigr])\cdot \bigl(\hat{V_1}\cdot \hat{Q_1}\bigr)_{b_1-\text{bit}}\cdot \text{diag}(\bigl[s_{q,1},...,s_{q,d}\bigr]) + \\ & \text{diag}(\bigl[s_{2,1},...,s_{2,l}\bigr])\cdot \bigl(\hat{V_2}\cdot \hat{Q_2}\bigr)_{b_1-\text{bit}}\cdot \text{diag}(\bigl[s_{q,1},...,s_{q,d}\bigr])
+\end{align}
+    
+\textcolor{red}{其中$\bigl(\hat{V_1}\cdot \hat{Q_1}\bigr)_{b_1-\text{bit}}$和$\bigl(\hat{V_2}\cdot \hat{Q_2}\bigr)_{b_1-\text{bit}}$表示两次$b_1$精度的矩阵乘法，由于$\hat{Q_2}$为$b_1$精度，因此需要先对$b_2$精度的$\hat{V_2}$转为$b_1$精度再计算，但数据类型转换的时间可以忽略且向更高的数据类型转换不会影响$\hat{V_2}$的数值精度。两次低精度矩阵乘法以及矩阵相加总共需要的FLOPs数量为$\mathcal{O}(lr_1d+lr_2d+ld)=\mathcal{O}(l(r_1+r_2+1)d)$。其中$ld$两个结果矩阵求和的FLOPs数量。两次相乘再求和与原本重建时只做一次矩阵乘法的FLOPs$\mathcal{O}(l(r_1+r_2)d)$相比几乎没有增加，并且反量化时左/右乘对角矩阵的操作可以看作矩阵每行/列乘同一个数，计算开销相较于矩阵乘法可以忽略。因此整个重建过程由于耗时最高的矩阵乘法变为了低精度计算，在硬件提供低精度高效计算支持的情况下，能够优化对Value重建过程的计算开销。后续~\ref{chap:exp}章节会证明，我们为了提升重建效率对$Q$进行量化的做法与用Float16的$Q$进行重建相比并不会有明显的模型精度损失。}
+
+
+
+%\subsection{可控的混合粒度量化}
+%前述混合精度框架侧重于“哪些秩用高精度、哪些秩用低精度”。然而在具体实现低比特量化时，我们还必须面对粒度选择带来的性能影响：最初实验结果（表~\ref{tab:value-quant-granularity}）表明，若直接对 Value 施以通道级 2-bit 量化，困惑度会骤然升高；只有切换到更细粒度（如 group-wise）后，才能恢复到可接受水平，两者的区别在于量化目标矩阵中有多少个元素共享同一个量化的系数。这意味着，长尾秩虽然可以以低精度保存，但仍需要细粒度量化来降低量化噪声，否则就可能会导致导致模型性能的退化。
+
+%问题在于：传统“先低秩压缩再量化”的 pipeline 会导致各层保留的维度 $r_{v,l}$ 互不相同，而 group-wise 量化要求量化目标的特征数能够整除预设的 group-size（例如 32 或 64）大小，否则组内统计与反量化流程都无法对齐。这样一来，要么被迫退回到较粗粒度（牺牲质量），要么在每层为补齐分组而填充零造成额外的存储开销，都不利于 Value 缓存的低比特压缩。
+
+%我们在上一节中保留了完整的 $d$ 个秩，并且只通过高/低精度划分来匹配目标压缩率。这一设计带来额外的自由度：对于低精度集合，我们可以按组增减秩（例如增加或减少一个 group 的秩数量），再将多余的秩转移到高精度集合，从而保证低精度部分的特征数始终整除 group-size。具体做法是：先根据式~\eqref{eq:equal_bit}–\eqref{eq:rank} 求得理论的 $r_1,r_2$，随后对 $r_2$ 进行“四舍五入到最近的组数”处理，若发生偏差，则用相同数量从 $r_1$ 中增减秩以保持总数为 $d$ 并维持总 bit 数不变。因为我们仍旧持有所有秩的信息，并未真正截断尾部，所以这种秩调度只改变“哪些秩属于低精度集合”，不会破坏低秩分解本身。
+
+%借助这一“可控混合粒度”机制，我们最终实现了三重结合：重要秩使用高精度、无需细粒度；非重要秩使用低精度，并强行对齐到设定的 group-wise 粒度，如此才能真正发挥 2-bit/4-bit 量化的潜力。实验中我们发现，4比特作为低精度秩的量化目标数据类型时，group-size一般设为32就会有较好效果，而2-bit作为低精度秩的量化目标数据类型时则需要更细粒度的 group-size。因此，本章提出的方案不仅在精度维度上进行了差异化处理，还在粒度上实现了自动可控的对齐，彻底解决了“低秩裁剪导致特征数不整除 group-size”的工程瓶颈。在相同的模型预算与量化位宽下，我们的方案相较于“先低秩再量化”的传统 pipeline 能获得更低的困惑度和更稳定的推理质量。进一步地，我们也将与 Key 相同的 Hadamard 融合策略应用到 Value 的量化分支，以在保持表达一致性的同时减少在线额外变换开销。本章节提出算法的伪代码~\ref{alg:hybrid-quant}。
+
+\iffalse
+\begin{algorithm}[htbp]
+\caption{低秩感知的混合精度与可控粒度量化流程}
+\label{alg:hybrid-quant}
+\KwIn{%
+    校准集 $\mathcal{D}_{\text{cal}}$；\\%
+    每层奇异值能量 $\{\sigma_{k,l,i}\}, \{\sigma_{v,l,i}\}$；\\%
+    目标位宽 $b$、高精度位宽 $b_1$、低精度位宽 $b_2$；\\%
+    目标压缩率 $\rho$、group-size $G$；\\%
+    Hadamard 阶 $H_l$ 及对应矩阵 $H_l$；\\%
+    低秩秩分配结果 $\{r_{k,l}, r_{v,l}\}$，来自~\ref{chap:scaling_svd},~\ref{chap:rank_search}
+}
+\KwOut{%
+    Key 缓存量化参数 $\{s_{k,l}, z_{k,l}, Q_{k,l}\}$；\\%
+    Value 缓存混合精度量化参数 $\{s^{(1)}_{v,l}, s^{(2)}_{v,l}, z^{(1)}_{v,l}, z^{(2)}_{v,l}\}$；\\%
+    变换后矩阵 $\{(S_k^{-1}P_k)', (Q_k)'\}$ 与 Value 量化掩码
+}
+\BlankLine
+\For{$l \gets 1$ \KwTo $L$}{
+    \tcc{Key 分支：低秩 + Hadamard + 单一低比特}
+    依据 $r_{k,l}$ 从 $S_k W_k$ 中提取主奇异向量，构造 $S_k^{-1}P_{k,l}$、$Q_{k,l}$；\\
+    将 Hadamard 矩阵 $H_l$ 吸入前半部分：$(S_k^{-1}P_{k,l})' \gets S_k^{-1}P_{k,l} H_l$；\\
+    将 $H_l^{-1}$ 吸入后半部分：$(Q_{k,l})' \gets H_l^{-1} Q_{k,l}$；\\
+    计算低秩压缩率 $\rho_{1,l}^{(k)} = r_{k,l}/d$，位宽压缩率 $\rho_{2,l}^{(k)} = 16/b$；\\
+    设定 Key 层压缩率 $\rho_{k,l} = \rho_{1,l}^{(k)} \rho_{2,l}^{(k)}$；\\
+    \ForEach{$x \in \mathcal{D}_{\text{cal}}$}{
+        计算中间缓存 $h_{k,l} \gets x (S_k^{-1}P_{k,l})'$；\\
+        估计对称量化尺度 $s_{k,l}$、零点 $z_{k,l}$ 并量化为 $b$ 比特；\\
+        累积 L2 误差以检查量化后精度，如 Section~\ref{sec:dp_for_inference} 所述；
+    }
+    存储 $\{s_{k,l}, z_{k,l}, (Q_{k,l})'\}$ 作为 Key 层最终参数；
+    \BlankLine
+    \tcc{Value 分支：混合精度 + 可控粒度}
+    计算低秩压缩率 $\rho_{1,l}^{(v)} = r_{v,l}/d$，目标位宽压缩率 $\rho_{2,l}^{(v)} = b/16$；\\
+    求解高/低精度秩数 $r_{1,l}, r_{2,l}$，满足式~\eqref{eq:equal_bit} 与~\eqref{eq:rank}；\\
+    将 $r_{2,l}$ 四舍五入到最近的 group 数：$\tilde{r}_{2,l} = \operatorname{round}(r_{2,l} / G) \cdot G$；\\
+    调整 $r_{1,l} \gets d - \tilde{r}_{2,l}$，并相应更新 $\rho_{2,l}^{(v)}$ 保持等比特约束；\\
+    根据奇异值能量排序，选取前 $r_{1,l}$ 个秩为高精度集合 $\mathcal{H}_l$，其余为低精度集合 $\mathcal{L}_l$；\\
+    \ForEach{$x \in \mathcal{D}_{\text{cal}}$}{
+        计算 Value 缓存 $h_{v,l} \gets x S_{v,l}^{-1} P_{v,l}$；\\
+        对 $\mathcal{H}_l$ 使用 $b_1$ 比特量化，得到尺度 $s^{(1)}_{v,l}$、零点 $z^{(1)}_{v,l}$；\\
+        将 $\mathcal{L}_l$ 按 group-size $G$ 分组，对每组使用 $b_2$ 比特量化，记录 $s^{(2)}_{v,l,g}$、$z^{(2)}_{v,l,g}$；\\
+        若分组后仍出现 outlier，则对该组单独执行 Hadamard 预处理；
+    }
+    保存高精度与低精度位宽掩码，并记录层级压缩率 $\rho_{v,l}$；
+}
+\BlankLine
+输出平均压缩率 $\rho_{\text{key}} = \frac{1}{L}\sum_l \rho_{k,l}$、$\rho_{\text{value}} = \frac{1}{L}\sum_l \rho_{v,l}$ 以及全部量化参数，供推理阶段直接解码；
+\end{algorithm}
+\fi
+
+\subsection{小结}
+\textcolor{red}{本章围绕“低秩分解 + 混合精度量化”对 KV 缓存进行更高压缩率的压缩并提高低秩KV缓存重建效率展开。首先，我们分析 Key/Value 的奇异值能量差异，并提出 Key 侧沿用此前方法中的低秩裁剪后配合 Hadamard 融合与低比特量化，Value 侧则由于能量低的奇异值仍包含一些有价值的信息，创新地采用保留全部秩的混合精度量化方案。随后，针对此前方法中低秩Value重建的较高额外开销问题，提出对重建投影矩阵也进行量化，考虑到Value混合精度量化的影响，分别用理论高效的低精度数据类型矩阵乘计算并反量化高精度Value与低精度Value与量化后重建矩阵相乘的结果，将其相加得到最终重建结果。整体来看，本章方法在再前两章的基础上引入量化技术路线进一步降低了 KV 缓存体积，相比简单地“先低秩再量化”能更好地保留模型性能，并缓解了此前低秩压缩KV方法中普遍存在的重建开销高的问题。}
+
+%长尾秩仍需细粒度量化的问题，我们引入可控分组机制，让低精度集合在位宽不变的前提下对齐任意 group-size，从而兼顾压缩率与精度。最后，通过统一的伪代码描述，将 Key 和 Value 的差异化策略整合进一套端到端流程。整体来看，本章方法在再前两章的基础上进一步降低了 KV 缓存体积，相比“先低秩再量化”具备更好的困惑度表现，为后续的推理部署提供了高性价比的压缩范式。
+% ===== End: methdology3 =====
+
+\fi
