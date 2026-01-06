@@ -8,7 +8,8 @@
       "contents/intro.tex",
       "contents/method.tex",
       "contents/experiments.tex",
-      "contents/summary.tex"
+      "contents/summary.tex",
+      "contents/abstract.tex"
     ],
     "editing_principles": [
       "不改变论文结构与主要技术内容，仅对叙述口径做统一替换/补充",
@@ -291,6 +292,42 @@
       "rationale": "将消融实验段落中对秩分配算法的表述改为“子空间重要性”。",
       "how_to_apply": [
         "在该段落中按短语替换"
+      ]
+    },
+    {
+      "id": "abstract-zh-attn-dist-subspace-importance",
+      "file": "contents/abstract.tex",
+      "type": "replace_paragraph",
+      "anchor_hint": "\\begin{abstract}[zh] 中未注释的中文摘要正文段落（以“大语言模型在自回归生成中依赖KV缓存…”开头）",
+      "old_excerpt": [
+        "现有低秩KV特征压缩方法仍存在不足：其一，以激活分布指导参数低秩分解，而V的参数在计算过程中还要与注意力分数相乘，引入注意力分数能让低秩近似的优化目标更接近注意力计算的输出；其二，在模型未压缩状态下评估层重要度并分配压缩率，忽略了层间压缩对彼此的影响，易对层重要程度产生误判；其三，按压缩率直接截断尾部奇异值以降维...",
+        "提出“注意力-激活”感知低秩分解...",
+        "评估层重要度并迭代重分配..."
+      ],
+      "new_excerpt": [
+        "现有低秩KV特征压缩方法仍存在不足：其一，以激活分布指导参数低秩分解，而V的参数在计算过程中还要与注意力分数相乘，引入注意力分数（注意力分布）能让低秩近似的优化目标更接近注意力计算的输出；其二，在模型未压缩状态下评估层间子空间重要性并分配压缩率，忽略了层间压缩对彼此的影响，易对层间子空间重要性产生误判；其三，按压缩率直接截断尾部奇异值以降维...",
+        "提出“注意力分布-激活”感知低秩分解...",
+        "评估层间子空间重要性并迭代重分配..."
+      ],
+      "rationale": "摘要中同步对齐新题目的两条主线：Value侧强调注意力分布；层间秩分配与层内混合精度强调子空间重要性。",
+      "how_to_apply": [
+        "定位中文摘要未注释正文段落，将对应句式按 `new_excerpt` 的措辞替换（不改变段落结构与结论）"
+      ]
+    },
+    {
+      "id": "abstract-en-subspace-importance",
+      "file": "contents/abstract.tex",
+      "type": "replace_sentence_span",
+      "anchor_hint": "\\begin{abstract}[en] 中未注释英文摘要正文段落（以“Large language models (LLMs) rely ...”开头）",
+      "old_excerpt": [
+        "Second, they assess layer importance and allocate layer-wise compression ratios in the uncompressed model, ignoring inter-layer interactions under compression and potentially misestimating layer importance."
+      ],
+      "new_excerpt": [
+        "Second, they allocate layer-wise compression ratios by estimating importance in the uncompressed model, ignoring inter-layer interactions under compression and potentially misestimating inter-layer subspace importance."
+      ],
+      "rationale": "英文摘要与中文题目一致，把“layer importance”升级为“inter-layer subspace importance”。",
+      "how_to_apply": [
+        "在英文摘要对应句中按 `new_excerpt[0]` 替换"
       ]
     }
   ]
