@@ -86,6 +86,8 @@ df["名称"] = df["名称"].astype(str).str.strip()
 print("Synthesizing 'code' column from code2000/2010/2020...")
 df["code"] = np.nan
 
+# 对于每一行，根据 year 列的值，选择对应的 code 列
+# 这样即使某行同时有 code2000 和 code2010，也会根据 year 来决定用哪个
 # 2000
 mask_2000 = (df["year"] == 2000)
 if "code2000" in df.columns:
