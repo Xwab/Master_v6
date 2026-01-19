@@ -17,14 +17,15 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # ===================== 0) 配置 =====================
 # 请根据实际情况修改路径
-excel_path = "/home/users/yyb/last/567append_all.xlsx"
+# excel_path = "/home/users/yyb/last/567append_all.xlsx"
+excel_path = "567append_all.xlsx" # 使用当前目录下的文件
 sheet_name = "Sheet1"
 
 # 邻接矩阵路径 (已确认存在)
 adj_paths = {
-    2000: "/workspace/W2000_raw.txt",
-    2010: "/workspace/W2010_raw.txt",
-    2020: "/workspace/W2020_full_raw.txt"
+    2000: "W2000_raw.txt",
+    2010: "W2010_raw.txt",
+    2020: "W2020_full_raw.txt"
 }
 
 # === 关键配置 ===
@@ -36,8 +37,10 @@ USE_KNN_FEATURES = True      # KNN特征 (作为辅助环境背景)
 USE_ADJ_FEATURES = True      # 是否使用邻接矩阵
 MAX_ADJ_NEIGHBORS = 6        # 每个样本最多保留几个物理邻居进入注意力网络 (不足补0)
 
-out_cv_xlsx   = "/home/users/yyb/last/cv_residual_nn_knn_separated.xlsx"
-out_pred_xlsx = "/home/users/yyb/last/completed_residual_nn_knn_separated.xlsx"
+# out_cv_xlsx   = "/home/users/yyb/last/cv_residual_nn_knn_separated.xlsx"
+# out_pred_xlsx = "/home/users/yyb/last/completed_residual_nn_knn_separated.xlsx"
+out_cv_xlsx   = "cv_residual_nn_knn_separated.xlsx"
+out_pred_xlsx = "completed_residual_nn_knn_separated.xlsx"
 
 # 创建输出目录
 for p in [out_cv_xlsx, out_pred_xlsx]:
@@ -77,6 +80,26 @@ except FileNotFoundError:
 
 df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
 df["名称"] = df["名称"].astype(str).str.strip()
+
+# --- 新增: 处理 Code 列 ---
+# 根据年份合并 code2000, code2010, code2020 到单一的 'code' 列
+print("Synthesizing 'code' column from code2000/2010/2020...")
+df["code"] = np.nan
+
+# 2000
+mask_2000 = (df["year"] == 2000)
+if "code2000" in df.columns:
+    df.loc[mask_2000, "code"] = df.loc[mask_2000, "code2000"]
+
+# 2010
+mask_2010 = (df["year"] == 2010)
+if "code2010" in df.columns:
+    df.loc[mask_2010, "code"] = df.loc[mask_2010, "code2010"]
+
+# 2020
+mask_2020 = (df["year"] == 2020)
+if "code2020" in df.columns:
+    df.loc[mask_2020, "code"] = df.loc[mask_2020, "code2020"]
 
 # 确保代码列存在
 if CODE_COL_NAME not in df.columns:
