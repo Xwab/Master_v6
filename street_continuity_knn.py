@@ -19,6 +19,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 excel_path = "/home/users/yyb/last/567append_all.xlsx"
 sheet_name = "Sheet1"
 
+# === 开关: 是否使用 KNN 邻居特征作为输入 ===
+USE_KNN_FEATURES = True
+
 out_cv_xlsx   = "/home/users/yyb/last/cv_residual_nn_knn_separated.xlsx"
 out_pred_xlsx = "/home/users/yyb/last/completed_residual_nn_knn_separated.xlsx"
 
@@ -254,7 +257,8 @@ def process_period(wide_df, names_subset, year_prev, year_curr, is_training_data
                 sample_feats.append(np.nan)
                 
         # D. KNN 邻居特征
-        sample_feats.extend(nbr_feats)
+        if USE_KNN_FEATURES:
+            sample_feats.extend(nbr_feats)
         
         # --- Target (Residuals) ---
         # Base value = Prev year target
@@ -345,6 +349,7 @@ X_pred_raw = np.array(X_pred_list, dtype=np.float32)
 Pred_Base_Y = np.array(Base_pred_list, dtype=np.float32)
 
 print(f"Dataset Constructed.")
+print(f"Using KNN Features: {USE_KNN_FEATURES}")
 print(f"Train samples: {len(X_train_raw)} (From 2000->2010 and 2010->2020)")
 print(f"Pred samples:  {len(X_pred_raw)} (From 2010->2020 Missing Labels)")
 
