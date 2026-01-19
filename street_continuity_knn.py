@@ -117,9 +117,9 @@ def get_valid_names(df_wide, y1, y2, check_cols_prefix):
     valid_indices = []
     for idx, row in df_wide.iterrows():
         # 检查 y1
-        has_y1 = any(pd.notna(row.get(f"{v}_{y1}", np.nan)) for v in feature_base)
+        has_y1 = all(pd.notna(row.get(f"{v}_{y1}", np.nan)) for v in feature_base)
         # 检查 y2
-        has_y2 = any(pd.notna(row.get(f"{v}_{y2}", np.nan)) for v in feature_base)
+        has_y2 = all(pd.notna(row.get(f"{v}_{y2}", np.nan)) for v in feature_base)
         
         if has_y1 and has_y2:
             valid_indices.append(row["名称"])
