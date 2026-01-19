@@ -271,15 +271,22 @@ def process_period(wide_df, names_subset, year_prev, year_curr, is_training_data
         if is_training_data: # 或者是构建 potential training sample
             # 检查是否有 Target Label
             for idx_t, t in enumerate(target_base):
+                # 修改：根据 raw count (target_base_no_sacle) 是否为 NaN 来判断是否缺失
+                # 注意：target_base_no_sacle 必须与 target_base 顺序对应
+                t_raw = target_base_no_sacle[idx_t]
+                col_name_raw = f"{t_raw}_{year_curr}"
+                val_raw = sub_df.at[i, col_name_raw] if col_name_raw in sub_df.columns else np.nan
+
                 col_name = f"{t}_{year_curr}"
                 val_curr = sub_df.at[i, col_name] if col_name in sub_df.columns else np.nan
                 val_prev = base_vals[idx_t]
                 
-                if pd.notna(val_curr) and pd.notna(val_prev):
+                # 判定条件：Raw Count 非空 (表示当前年份数据有效，哪怕 val_curr 是 0) 且 Prev 非空
+                if pd.notna(val_raw) and pd.notna(val_prev):
                     residuals.append(val_curr - val_prev)
                 else:
                     residuals.append(np.nan)
-                    has_labels = False # 只要有一个target缺失，就视为无完整label (或者根据需求)
+                    has_labels = False # 只要有一个target缺失，就视为无完整label
         
         # 收集结果
         # 注意：预测集不需要 has_labels 为真
