@@ -1,0 +1,359 @@
+{
+  "metadata": {
+    "repo": "masters-thesis",
+    "title_old": "注意力感知的KV缓存特征维压缩",
+    "title_new": "注意力分布和子空间重要性感知的KV缓存特征维压缩",
+    "generated_at": "2026-01-06",
+    "scope": [
+      "contents/intro.tex",
+      "contents/method.tex",
+      "contents/experiments.tex",
+      "contents/summary.tex",
+      "contents/abstract.tex"
+    ],
+    "editing_principles": [
+      "不改变论文结构与主要技术内容，仅对叙述口径做统一替换/补充",
+      "注意力感知：强调 Value 侧低秩近似在目标函数中显式引入注意力分数（可体现注意力分布差异）",
+      "子空间重要性感知：用“奇异向量张成的子空间 + 奇异值能量/端到端敏感性刻画重要性”统一解释层间秩分配与层内混合精度"
+    ]
+  },
+  "changes": [
+    {
+      "id": "method-chapter-title-and-lead",
+      "file": "contents/method.tex",
+      "type": "replace_and_insert",
+      "anchor_hint": "\\chapter{...} 与紧随其后的 \\section{注意力与激活感知的低秩KV缓存特征压缩}",
+      "old_excerpt": [
+        "\\chapter{基于低秩性质的KV缓存压缩方法}",
+        "\\label{chap:method}",
+        "",
+        "\\section{注意力与激活感知的低秩KV缓存特征压缩}"
+      ],
+      "new_excerpt": [
+        "\\chapter{注意力分布与子空间重要性感知的KV缓存特征维压缩方法}",
+        "\\label{chap:method}",
+        "",
+        "\\textcolor{red}{}本章围绕“注意力分布与子空间重要性感知”的KV缓存特征维压缩展开，给出一套在推理阶段直接压缩KV缓存特征维度、同时尽可能保持模型精度的完整方法框架，并将该标题中的两条核心思想落实到后续三节的具体设计中：首先，在\\ref{chap:scaling_svd}节提出注意力与激活感知的低秩分解算法，其中对Value侧在低秩近似目标中显式引入注意力分数$A$，以反映不同注意力头/组的注意力分布差异，使近似目标更贴近推理阶段真实注意力输出；其次，在\\ref{chap:rank_search}节提出迭代式层间秩分配策略，将每层（经变换后的）KV投影在SVD下由奇异向量张成的表示子空间作为分配对象，结合奇异值能量与端到端敏感性刻画层间子空间重要性，从而在固定总体压缩预算下自适应分配各层保留秩；最后，在\\ref{chap:quant_low_rank}节提出低秩感知的混合精度量化压缩方案，在层内依据子空间重要性对Value的头部/尾部奇异分量分配不同数值精度，以“尾部低精度”的形式保留长尾信息并提升高压缩率场景下的稳健性。通过上述三部分协同，本章方法实现了从“分解目标—层间预算—层内精度”三个层面共同对齐推理过程与信息重要性的KV缓存特征维压缩。",
+        "",
+        "\\section{注意力与激活感知的低秩KV缓存特征压缩}"
+      ],
+      "rationale": "使 `method.tex` 的章节标题与后续三节（注意力/激活感知分解、子空间重要性秩分配、子空间重要性混合精度量化）一一对应，并在章节开头给出总起说明。",
+      "how_to_apply": [
+        "将原章节标题替换为新标题",
+        "在 `\\label{chap:method}` 与第一个 `\\section` 之间插入总起段落"
+      ]
+    },
+    {
+      "id": "intro-attn-dist-aware-framing",
+      "file": "contents/intro.tex",
+      "type": "replace_block",
+      "anchor_hint": "本文的核心研究，就是围绕 SVD 驱动的 KV 特征降维框架展开。",
+      "old_excerpt": [
+        "本文的核心研究，就是围绕 SVD 驱动的 KV 特征降维框架展开。\\textcolor{red}{}基于SVD特征降维压缩KV缓存的技术路线已经有一些方法有过探索\\cite{chang2025palu,yuan2023asvd,zhang2024lorc}，但由于他们对于参数矩阵分解的方式以及在整体KV压缩率固定的情况下分配各层压缩率的方法仍不够完善，因此在特征维度压缩KV后模型精度下降较大。",
+        "在模型推理过程中KV参数矩阵并非孤立存在，需要与输入进行计算，之前的方法考虑到了参数矩阵会与激活值相乘，用激活值的分布来指导参数矩阵的分解。",
+        "而大模型的注意力层中，Value参数矩阵不仅要和激活值相乘，注意力计算的输出实际上是Query和Key相乘得到的注意力分数依次与激活值，参数矩阵相乘得到的。在SVD时引入注意力分数的影响，直接优化注意力输出在低秩近似前后的误差可以进一步减少压缩后模型的精度损失。因此，本文的一个主要研究内容是如何在做基于SVD的KV缓存特征维度压缩时考虑到激活值和注意力分数的影响。",
+        "此外，此前的方法考虑到模型不同层在推理时重要程度不同，因此设计了层间秩分配（即压缩率分配）方案。",
+        "因此，在当前满足模型整体压缩预算的秩分配下，如何在所有层都处于压缩状态时根据每层KV的重要程度来动态分配压缩率，成为本文的另一项核心研究内容。"
+      ],
+      "new_excerpt": [
+        "本文的核心研究，就是围绕 SVD 驱动的 KV 特征降维框架展开。\\textcolor{red}{}基于SVD特征降维压缩KV缓存的技术路线已经有一些方法有过探索\\cite{chang2025palu,yuan2023asvd,zhang2024lorc}，但由于他们对于参数矩阵分解的方式以及在整体KV压缩率固定的情况下分配各层压缩率的方法仍不够完善，因此在特征维度压缩KV后模型精度下降较大。",
+        "在模型推理过程中KV参数矩阵并非孤立存在，需要与输入进行计算，之前的方法考虑到了参数矩阵会与激活值相乘，用激活值的分布来指导参数矩阵的分解。",
+        "而大模型的注意力层中，Value参数矩阵不仅要和激活值相乘，注意力计算的输出实际上是Query和Key相乘得到的注意力分数依次与激活值，参数矩阵相乘得到的。在SVD时引入注意力分数（不同注意力头/组的注意力分布）的影响，直接优化注意力输出在低秩近似前后的误差可以进一步减少压缩后模型的精度损失。因此，本文的一个主要研究内容是如何在做基于SVD的KV缓存特征维度压缩时实现\\textbf{注意力感知}的低秩近似。",
+        "",
+        "\\textcolor{red}{}此外，此前的方法考虑到模型不同层在推理时重要程度不同，因此设计了层间秩分配（即压缩率分配）方案。",
+        "因此，在当前满足模型整体压缩预算的秩分配下，如何在所有层都处于压缩状态时刻画并利用\\textbf{每层KV子空间的重要性}来动态分配压缩率，成为本文的另一项核心研究内容。这里的“子空间”指每层（经变换后的）KV投影矩阵在SVD下由奇异向量张成的表示子空间，而奇异值能量与端到端输出敏感性可以用来刻画该子空间的相对重要性。"
+      ],
+      "rationale": "保留“注意力感知”的命名不变，并将层间秩分配的“层重要程度”统一解释为“每层KV子空间重要性”。",
+      "how_to_apply": [
+        "在 `contents/intro.tex` 中定位 `本文的核心研究...` 段落",
+        "用 `new_excerpt` 整段替换 `old_excerpt`"
+      ]
+    },
+    {
+      "id": "intro-value-tail-subspace-importance",
+      "file": "contents/intro.tex",
+      "type": "replace_sentence_span",
+      "anchor_hint": "此外，从图~\\ref{fig:energy_key_0}和~\\ref{fig:energy_value_0}",
+      "old_excerpt": [
+        "\\textcolor{red}{}此外，从图~\\ref{fig:energy_key_0}和~\\ref{fig:energy_value_0}中的奇异值累积能量占比可以看出，尽管Key和Value都表现出了低秩性，即奇异值能量占比都快速上升，少部分的头部秩就到达了80\\%以上的较高累积能量占比，但Value和Key的奇异值能量分布并不完全一样：Key的尾部奇异值几乎不提供能量，而Value的尾部奇异值虽然单个能量占比小，但其持续累积仍然使得奇异值能量占比不断上升。"
+      ],
+      "new_excerpt": [
+        "\\textcolor{red}{}此外，从图~\\ref{fig:energy_key_0}和~\\ref{fig:energy_value_0}中的奇异值累积能量占比可以看出，尽管Key和Value都表现出了低秩性，即奇异值能量占比都快速上升，少部分的头部秩就到达了80\\%以上的较高累积能量占比，但Value和Key的奇异值能量分布并不完全一样：Key的尾部奇异值几乎不提供能量，而Value的尾部奇异值虽然单个能量占比小，但其持续累积仍然使得奇异值能量占比不断上升。若把奇异向量张成的方向视为不同的信息子空间，则头部奇异值对应的是更重要的子空间，而长尾奇异值对应的是重要性更低但并非完全无用的子空间。"
+      ],
+      "rationale": "把“头/尾奇异值差异”显式解释为“子空间重要性差异”，为后续混合精度提供术语基础。",
+      "how_to_apply": [
+        "在该段落中将 `new_excerpt[0]` 替换 `old_excerpt[0]`（仅增加一句子空间解释）"
+      ]
+    },
+    {
+      "id": "intro-contribution-quant-as-subspace-precision",
+      "file": "contents/intro.tex",
+      "type": "replace_sentence_span",
+      "anchor_hint": "Value相较于Key在低秩性上存在差异",
+      "old_excerpt": [
+        "\\item \\textcolor{red}{}Value相较于Key在低秩性上存在差异，Value尾部的奇异值仍然对总信息量有一定贡献。现有基于SVD的特征压缩方法“非1即0”地直接丢弃尾部奇异值会造成Value的信息损失，压缩后模型精度下降大。为此我们提出了一种低秩感知的量化压缩方案：不再将 Value 的尾部奇异值完全丢弃，而是对其进行低精度量化。以“低分辨率”的形式保留尾部奇异值；同时对信息量更集中的头部奇异值使用更高精度（或全精度，取决于压缩率）维持细节，通过保留Value更多的信息缓解了模型能力退化。"
+      ],
+      "new_excerpt": [
+        "\\item \\textcolor{red}{}Value相较于Key在低秩性上存在差异，Value尾部的奇异值仍然对总信息量有一定贡献。现有基于SVD的特征压缩方法“非1即0”地直接丢弃尾部奇异值会造成Value的信息损失，压缩后模型精度下降大。为此我们提出了一种低秩感知的量化压缩方案：不再将 Value 的尾部奇异值完全丢弃，而是对其进行低精度量化。以“低分辨率”的形式保留尾部奇异值；同时对信息量更集中的头部奇异值使用更高精度（或全精度，取决于压缩率）维持细节。该策略等价于在层内\\textbf{按子空间重要性分配数值精度}：头部奇异向量张成的重要子空间用高精度保存，尾部子空间用低精度保存，从而在相同压缩率下尽量保留Value的有效信息并缓解模型能力退化。"
+      ],
+      "rationale": "把“低秩感知量化”明确为“按子空间重要性分配精度”，对齐新题目。",
+      "how_to_apply": [
+        "在 `研究贡献` 的第二条贡献中，将整句替换为 `new_excerpt[0]`"
+      ]
+    },
+    {
+      "id": "method-rank-allocation-subspace-definition",
+      "file": "contents/method.tex",
+      "type": "insert_sentence_after",
+      "anchor_hint": "我们通过低秩性在全模型秩预算约束下",
+      "old_excerpt": [
+        "\\textcolor{red}{}我们通过低秩性在全模型秩预算约束下（由模型KV缓存总压缩率计算）对每层保留的秩进行先验分配，并根据压缩每层导致的模型端到端输出变化衡量每一层在当前秩分配下的重要性与其分配的秩数量之间的不匹配程度，运行一个逐步迭代的贪心分配算法不断更新每层的Key和Value的秩以不断减小当前模型压缩状态下每一层秩分配数量与其实际重要程度的差异。"
+      ],
+      "new_excerpt": [
+        "\\textcolor{red}{}从“子空间”的角度看，经过\\ref{chap:scaling_svd}小节的变换后，每层的KV投影矩阵都可以用其奇异向量张成的一组表示子空间来刻画；不同层这些子空间对端到端输出的贡献不同，其重要性也不同。我们通过低秩性在全模型秩预算约束下（由模型KV缓存总压缩率计算）对每层保留的秩进行先验分配，并根据压缩每层导致的模型端到端输出变化衡量每一层在当前秩分配下的\\textbf{子空间重要性}与其分配的秩数量之间的不匹配程度，运行一个逐步迭代的贪心分配算法不断更新每层的Key和Value的秩以不断减小当前模型压缩状态下每一层秩分配数量与其实际重要程度的差异。"
+      ],
+      "rationale": "在方法章节给出“子空间重要性”的正式落点（层间秩分配）。",
+      "how_to_apply": [
+        "在 `\\section{迭代式层间压缩率分配策略}` 开头第二段，将 `old_excerpt[0]` 替换为 `new_excerpt[0]`"
+      ]
+    },
+    {
+      "id": "method-quant-subspace-precision",
+      "file": "contents/method.tex",
+      "type": "replace_sentence_span",
+      "anchor_hint": "\\subsection{低秩感知的混合精度量化}",
+      "old_excerpt": [
+        "为此我们提出了低秩感知的混合精度量化方案来减少“非1即0”的丢弃式压缩方式对模型精度的损害，通过更低的精度来“低分辨率”存储尾部奇异值，全精度存储头部奇异值来保留其细节。"
+      ],
+      "new_excerpt": [
+        "为此我们提出了低秩感知的混合精度量化方案来减少“非1即0”的丢弃式压缩方式对模型精度的损害，本质上是对Value进行\\textbf{子空间重要性感知的精度分配}：奇异值更大的头部奇异向量张成的重要子空间用更高精度（或全精度）保留其细节；长尾子空间重要性更低但仍有贡献，用更低精度“低分辨率”存储以在同等压缩率下保留更多有效信息。"
+      ],
+      "rationale": "将层内混合精度明确解释为“子空间重要性感知”。",
+      "how_to_apply": [
+        "在该小节第一段中，将对应句子替换为 `new_excerpt[0]`"
+      ]
+    },
+    {
+      "id": "method-chapter-summary-subspace-wording",
+      "file": "contents/method.tex",
+      "type": "replace_phrase_multiple",
+      "anchor_hint": "本章小结中对秩分配与量化的总结",
+      "old_excerpt": [
+        "为后续根据每层KV的重要程度来细化秩的分配",
+        "衡量给每一层当前分配的秩与其实际重要程度之间的差异",
+        "并且，我们在更泛化的“低秩特征压缩+量化压缩”场景下说明了低秩感知的量化方式"
+      ],
+      "new_excerpt": [
+        "为后续根据每层KV\\textbf{子空间重要性}来细化秩的分配",
+        "衡量给每一层当前分配的秩与其实际子空间重要性之间的差异",
+        "并且，该策略可以理解为层内\\textbf{子空间重要性感知的混合精度分配}：重要子空间用高精度，次要子空间用低精度但不断舍弃。"
+      ],
+      "rationale": "在章节小结中把“重要程度”统一改为“子空间重要性”，并补上混合精度与子空间的重要性关系。",
+      "how_to_apply": [
+        "在 `\\section{本章小结}` 中进行逐句短语替换；如遇到多处相同短语，优先以段落上下文定位（参考本JSON中其他变更的 anchor_hint）"
+      ]
+    },
+    {
+      "id": "exp-intro-subspace-rank-allocation",
+      "file": "contents/experiments.tex",
+      "type": "replace_phrase",
+      "anchor_hint": "章节开头第一段",
+      "old_excerpt": [
+        "验证我们的\"注意力-激活感知\"的低秩近似算法和层间秩分配策略以及低秩感知的量化方法"
+      ],
+      "new_excerpt": [
+        "验证我们的\"注意力-激活感知\"的低秩近似算法、\\textbf{子空间重要性感知的层间秩分配策略}以及低秩感知的量化方法"
+      ],
+      "rationale": "让实验章节的口径与新题目一致，明确“层间秩分配=子空间重要性感知”。",
+      "how_to_apply": [
+        "在 `\\chapter{实验设计与结果分析}` 开头第一段按短语替换"
+      ]
+    },
+    {
+      "id": "exp-setup-subspace-rank-allocation",
+      "file": "contents/experiments.tex",
+      "type": "replace_phrase",
+      "anchor_hint": "章节开头第二段（方法对比与消融概览）",
+      "old_excerpt": [
+        "我们分别验证了我们的低秩近似算法和秩分配算法的有效性"
+      ],
+      "new_excerpt": [
+        "我们分别验证了我们的注意力感知低秩近似算法与\\textbf{子空间重要性感知的秩分配算法}的有效性"
+      ],
+      "rationale": "把“秩分配”在实验描述中落到“子空间重要性”。",
+      "how_to_apply": [
+        "在对应段落中按短语替换"
+      ]
+    },
+    {
+      "id": "exp-ablation-subspace-importance-wording",
+      "file": "contents/experiments.tex",
+      "type": "replace_phrase",
+      "anchor_hint": "消融实验叙述段落",
+      "old_excerpt": [
+        "评估各层重要性并迭代重分配",
+        "若关键层被过度压缩"
+      ],
+      "new_excerpt": [
+        "评估各层\\textbf{子空间重要性}并迭代重分配",
+        "若关键层子空间被过度压缩"
+      ],
+      "rationale": "把消融实验对秩分配机制的解释与“子空间重要性”对齐。",
+      "how_to_apply": [
+        "在 `\\subsection{消融实验}` 的大段文字说明中分别替换两处短语"
+      ]
+    },
+    {
+      "id": "exp-summary-subspace-importance-wording",
+      "file": "contents/experiments.tex",
+      "type": "replace_phrase_multiple",
+      "anchor_hint": "本章小结",
+      "old_excerpt": [
+        "基于当前秩分配下层重要程度的动态迭代秩分配算法",
+        "基于当前秩分配估计层重要程度并进行动态迭代重分配"
+      ],
+      "new_excerpt": [
+        "\\textbf{基于当前秩分配下层间子空间重要性评估的动态迭代秩分配算法}",
+        "基于当前秩分配估计\\textbf{层间子空间重要性}并进行动态迭代重分配"
+      ],
+      "rationale": "把实验章节总结中的“层重要程度”统一改为“层间子空间重要性”。",
+      "how_to_apply": [
+        "在 `\\section{本章小结}` 中分别替换两处短语"
+      ]
+    },
+    {
+      "id": "summary-layerwise-subspace-importance",
+      "file": "contents/summary.tex",
+      "type": "insert_sentence_span",
+      "anchor_hint": "其次，在全模型层间压缩预算分配方面",
+      "old_excerpt": [
+        "本文首先利用各层分解目标的奇异值能量分布进行全局秩分配初始化，使初始分配天然反映层间低秩性差异；随后在所有层均处于压缩状态下..."
+      ],
+      "new_excerpt": [
+        "本文将每层（经变换后的）KV投影矩阵在SVD下由奇异向量张成的表示子空间作为分配对象，以奇异值能量与端到端输出敏感性刻画\\textbf{子空间重要性}：首先利用各层分解目标的奇异值能量分布进行全局秩分配初始化，使初始分配天然反映层间低秩性差异；随后在所有层均处于压缩状态下..."
+      ],
+      "rationale": "在全文总结中把层间秩分配的核心思想清晰落到“子空间重要性”。",
+      "how_to_apply": [
+        "在该段落中插入/替换为 `new_excerpt[0]` 对应的扩展句"
+      ]
+    },
+    {
+      "id": "summary-value-precision-as-subspace-importance",
+      "file": "contents/summary.tex",
+      "type": "insert_sentence_span",
+      "anchor_hint": "本文提出对Value采取“头部奇异值全精度保留、尾部奇异值低精度压缩”",
+      "old_excerpt": [
+        "为此，本文提出对Value采取“头部奇异值全精度保留、尾部奇异值低精度压缩”的低秩感知量化策略代替原本丢弃尾部奇异值的方式，能够带来更大的性能收益。"
+      ],
+      "new_excerpt": [
+        "为此，本文提出对Value采取“头部奇异值全精度保留、尾部奇异值低精度压缩”的低秩感知量化策略代替原本丢弃尾部奇异值的方式，能够带来更大的性能收益。该策略等价于在层内\\textbf{按子空间重要性分配数值精度}：重要子空间保细节，次要子空间以低精度保留而非直接丢弃。"
+      ],
+      "rationale": "将“子空间重要性感知”在总结中落到层内精度分配。",
+      "how_to_apply": [
+        "在该句后追加 `new_excerpt[0]` 中新增的解释句"
+      ]
+    },
+    {
+      "id": "summary-experiments-wording",
+      "file": "contents/summary.tex",
+      "type": "replace_phrase",
+      "anchor_hint": "综合实验方面 ... 在适中压缩率（50%）下",
+      "old_excerpt": [
+        "在适中压缩率（50\\%）下，注意力-激活感知分解与迭代式层间秩分配能够稳定降低困惑度退化并提升下游任务表现"
+      ],
+      "new_excerpt": [
+        "在适中压缩率（50\\%）下，注意力感知分解与\\textbf{子空间重要性感知的迭代式层间秩分配}能够稳定降低困惑度退化并提升下游任务表现"
+      ],
+      "rationale": "把实验总结的措辞与新题目完全一致。",
+      "how_to_apply": [
+        "在对应句中按短语替换"
+      ]
+    },
+    {
+      "id": "method-rank-allocation-importance-to-subspace",
+      "file": "contents/method.tex",
+      "type": "replace_phrase_multiple",
+      "anchor_hint": "\\section{迭代式层间压缩率分配策略} 第一段",
+      "old_excerpt": [
+        "由于不同层的重要程度",
+        "量化衡量当前该层的重要程度"
+      ],
+      "new_excerpt": [
+        "由于不同层的子空间重要性不同",
+        "量化衡量当前该层的子空间重要性"
+      ],
+      "rationale": "把层间秩分配动机中的“重要程度”与新题目中的“子空间重要性”统一。",
+      "how_to_apply": [
+        "在该段落中按短语进行替换（保持原句其余部分不变）"
+      ]
+    },
+    {
+      "id": "method-rank-init-importance-to-subspace",
+      "file": "contents/method.tex",
+      "type": "replace_phrase",
+      "anchor_hint": "秩初始化小节末尾红色说明句",
+      "old_excerpt": [
+        "衡量每一层的重要程度"
+      ],
+      "new_excerpt": [
+        "衡量每一层的子空间重要性"
+      ],
+      "rationale": "让“秩初始化”与“后续迭代的重要性评估”在术语上对齐为“子空间重要性评估”。",
+      "how_to_apply": [
+        "在该句中按短语替换"
+      ]
+    },
+    {
+      "id": "exp-ablation-intro-importance-to-subspace",
+      "file": "contents/experiments.tex",
+      "type": "replace_phrase",
+      "anchor_hint": "\\subsection{消融实验} 首段",
+      "old_excerpt": [
+        "评估各层重要性并迭代重分配"
+      ],
+      "new_excerpt": [
+        "评估各层子空间重要性并迭代重分配"
+      ],
+      "rationale": "将消融实验段落中对秩分配算法的表述改为“子空间重要性”。",
+      "how_to_apply": [
+        "在该段落中按短语替换"
+      ]
+    },
+    {
+      "id": "abstract-zh-attn-dist-subspace-importance",
+      "file": "contents/abstract.tex",
+      "type": "replace_paragraph",
+      "anchor_hint": "\\begin{abstract}[zh] 中未注释的中文摘要正文段落（以“大语言模型在自回归生成中依赖KV缓存…”开头）",
+      "old_excerpt": [
+        "现有低秩KV特征压缩方法仍存在不足：其一，以激活分布指导参数低秩分解，而V的参数在计算过程中还要与注意力分数相乘，引入注意力分数能让低秩近似的优化目标更接近注意力计算的输出；其二，在模型未压缩状态下评估层重要度并分配压缩率，忽略了层间压缩对彼此的影响，易对层重要程度产生误判；其三，按压缩率直接截断尾部奇异值以降维...",
+        "提出“注意力-激活”感知低秩分解...",
+        "评估层重要度并迭代重分配..."
+      ],
+      "new_excerpt": [
+        "现有低秩KV特征压缩方法仍存在不足：其一，以激活分布指导参数低秩分解，而V的参数在计算过程中还要与注意力分数相乘，引入注意力分数（注意力分布）能让低秩近似的优化目标更接近注意力计算的输出；其二，在模型未压缩状态下评估层间子空间重要性并分配压缩率，忽略了层间压缩对彼此的影响，易对层间子空间重要性产生误判；其三，按压缩率直接截断尾部奇异值以降维...",
+        "提出“注意力-激活”感知低秩分解...",
+        "评估层间子空间重要性并迭代重分配..."
+      ],
+      "rationale": "摘要中同步对齐新题目的两条主线：Value侧强调注意力分布；层间秩分配与层内混合精度强调子空间重要性。",
+      "how_to_apply": [
+        "定位中文摘要未注释正文段落，将对应句式按 `new_excerpt` 的措辞替换（不改变段落结构与结论）"
+      ]
+    },
+    {
+      "id": "abstract-en-translate-latest-zh",
+      "file": "contents/abstract.tex",
+      "type": "replace_paragraph",
+      "anchor_hint": "\\begin{abstract}[en] 中未注释英文摘要正文段落（整段替换，以“Large language models (LLMs) rely ...”开头）",
+      "old_excerpt": [
+        "Large language models (LLMs) rely on the key–value (KV) cache during autoregressive generation to avoid redundant computation. However, the KV cache grows linearly with sequence length, creating dual bottlenecks in GPU memory footprint and memory bandwidth, and thus becoming a key constraint for long-context inference. Compressing the KV cache while preserving model accuracy is therefore an important direction for improving LLM inference efficiency. The KV cache size is jointly determined by the number of layers, the number of heads, the sequence length, the feature dimension, and the data type; this work focuses on feature-dimension compression under a low-rank decomposition framework. Existing low-rank KV feature compression methods still suffer from several limitations. First, they guide low-rank decomposition using activation distributions, yet the Value (V) parameters are further multiplied by attention scores during attention computation; incorporating the attention-score distribution makes the low-rank approximation objective closer to the actual attention outputs. Second, they allocate layer-wise compression ratios by estimating importance in the uncompressed model, ignoring inter-layer interactions under compression and potentially misestimating inter-layer subspace importance. Third, they reduce dimensionality by truncating tail ranks according to the assigned compression ratio, but although the tail ranks of the Value cache have low energy, they still carry information; hard truncation therefore causes information loss. To address these issues, we propose a KV-cache feature compression method that integrates a low-rank decomposition algorithm, an inter-layer rank allocation strategy, and a layer-wise compression scheme. We introduce an attention–activation-aware low-rank decomposition that explicitly models the effect of attention scores on the Value side, aligning the approximation objective more closely with the true attention outputs during inference. We further propose an iterative, inter-layer rank allocation strategy: it initializes ranks globally using singular-value energy distributions, then evaluates inter-layer subspace importance end-to-end on a calibration set while all layers are compressed, and iteratively reallocates ranks to mitigate overall performance degradation. Finally, to preserve the long-tail information in Value representations, we propose a low-rank-aware quantization scheme that retains tail components with lower precision and cooperates with mainstream KV quantization methods to enable higher compression ratios. We evaluate our approach on Llama3.1-8B-Instruct and Qwen2.5-7B-Instruct across language-modeling perplexity, zero-shot reasoning, and long-context benchmarks. Results show that our method is nearly lossless at a 30\\% compression ratio, achieves better overall performance than existing low-rank feature-compression baselines at 50\\% compression, and remains stable at high compression ratios of 75\\% and 87.5\\% with the help of low-rank-aware mixed-precision quantization. GPU memory measurements further demonstrate that our method substantially reduces KV-cache memory usage during inference, enabling longer input contexts on a single GPU. Overall, our method provides an interpretable and practical KV-cache compression solution for long-context LLM inference, preserving accuracy better than prior KV feature compression approaches."
+      ],
+      "new_excerpt": [
+        "Large language models (LLMs) rely on the key--value (KV) cache during autoregressive generation to avoid redundant computation. However, the KV cache grows linearly with the sequence length, creating dual bottlenecks in GPU memory footprint and memory bandwidth, and thus becoming a key constraint for long-context inference. Compressing the KV cache while preserving model accuracy is therefore an important direction for optimizing LLM inference. The KV cache size is jointly determined by the number of layers, the number of heads, the sequence length, the feature dimension, and the data type; this thesis focuses on feature-dimension compression under a low-rank decomposition framework. Existing low-rank KV feature compression methods still have several limitations. First, they guide low-rank decomposition using activation distributions, yet the Value (V) projection is further multiplied by attention scores during attention computation; incorporating attention scores makes the low-rank approximation objective closer to the attention outputs. Second, they estimate layer importance and allocate layer-wise compression ratios in the uncompressed model, ignoring inter-layer interactions under compression and potentially misestimating layer importance. Third, they reduce dimensionality by directly truncating tail singular values according to the target compression ratio, but although the tail singular values of Value have low energy, they still carry information; hard truncation therefore causes information loss. To address these issues, we propose an attention-distribution- and subspace-importance-aware KV-cache feature compression method that integrates a low-rank decomposition algorithm, an inter-layer rank allocation strategy, and an intra-layer compression scheme. We introduce an attention--activation-aware low-rank decomposition that explicitly models the effect of attention scores on the Value side, aligning the approximation objective more closely with the true attention outputs during inference. We further propose an iterative inter-layer rank allocation strategy: it first performs a global subspace-dimension initialization based on singular-value energy distributions, then evaluates layer subspace importance end-to-end on a calibration set while all layers remain compressed, and iteratively reallocates subspace dimensions to mitigate performance degradation. Finally, to preserve the long-tail information in Value, we propose a low-rank-aware quantization scheme that retains tail singular-value subspaces in low precision and works in conjunction with mainstream KV quantization methods to support higher compression ratios. We evaluate our approach on Llama3.1-8B-Instruct and Qwen2.5-7B-Instruct across language-modeling perplexity, zero-shot reasoning, and long-context benchmarks. Results show that our method is nearly lossless at a 30\\% compression ratio and achieves better overall performance than existing low-rank feature-compression baselines at 50\\% compression; at high compression ratios of 75\\% and 87.5\\%, it remains stable with the help of low-rank-aware mixed-precision quantization. Memory profiling further shows that our method substantially reduces KV-cache memory usage during inference, enabling longer input contexts on a single GPU. Overall, our method provides an interpretable and practical KV-cache compression solution for long-context LLM inference, preserving accuracy better than prior KV feature compression approaches."
+      ],
+      "rationale": "按用户提供的最新中文摘要逐句对齐翻译，保留其“layer importance / subspace-dimension reallocation / tail singular-value subspaces low precision”等表述口径。",
+      "how_to_apply": [
+        "定位英文摘要未注释正文段落，整段替换为 `new_excerpt[0]`"
+      ]
+    }
+  ]
+}
