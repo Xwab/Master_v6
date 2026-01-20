@@ -240,7 +240,7 @@ for y in all_years:
                 vals.append(val)
             lookup_maps[y][code] = vals
 
-# ===================== 3) 核心处理函数：提取特征 + 邻居Tensor =====================
+# ===================== 3) 核心处理函数：双路邻居特征 =====================
 def process_period(wide_df, names_subset, year_prev, year_curr, is_training_data=True):
     sub_df = wide_df[wide_df["名称"].isin(names_subset)].copy()
     if sub_df.empty: return [], [], [], []
@@ -267,16 +267,23 @@ def process_period(wide_df, names_subset, year_prev, year_curr, is_training_data
     col_idx_map = {c: i for i, c in enumerate(sub_df.columns)}
     data_matrix = sub_df.values
     
+    # 两个时间点的邻接信息
     adj_prev = adj_data.get(year_prev, {}) if USE_ADJ_FEATURES else {}
+    adj_curr = adj_data.get(year_curr, {}) if USE_ADJ_FEATURES else {}
+    
     lookup_prev = lookup_maps.get(year_prev, {})
+    lookup_curr = lookup_maps.get(year_curr, {})
+    
     col_code_prev = f"{CODE_COL_NAME}_{year_prev}"
+    col_code_curr = f"{CODE_COL_NAME}_{year_curr}"
 
     dim_vars_all = len(vars_all)
+    dim_feat_base = len(feature_base)
 
     for i in range(len(sub_df)):
         name = sub_df.iloc[i]["名称"]
         
-        # --- A. KNN 均值特征 (保留) ---
+        # --- A. KNN 均值特征 ---
         neighbor_idxs = indices[i, 1:] 
         knn_feats = []
         if USE_KNN_FEATURES:
@@ -292,33 +299,64 @@ def process_period(wide_df, names_subset, year_prev, year_curr, is_training_data
                 vals = data_matrix[neighbor_idxs, col_idx_map.get(col_name, 0)]
                 knn_feats.append(np.nanmean(vals.astype(float)))
 
-        # --- B. Spatial (Adj) 可训练特征 ---
-        # 我们这里只取 Prev Year 的邻居的全量特征 (因为有Label，信息量最大)
-        # 将其展开为 [N1_f1, N1_f2, ..., N2_f1, N2_f2...]
-        # 具体的 Attention 聚合交给模型
-        
-        adj_raw_feats = [] 
+        # --- B. Spatial (Adj) 双路特征 ---
+        # 1. Prev Year (Full Feature: Pop + Housing)
+        adj_prev_feats = [] 
         if USE_ADJ_FEATURES:
             my_code_prev = sub_df.at[i, col_code_prev] if col_code_prev in sub_df.columns else None
-            
             found_neighbors = []
             if my_code_prev in adj_prev:
                 nbr_codes = adj_prev[my_code_prev]
                 for n_code in nbr_codes:
                     if n_code in lookup_prev:
-                        found_neighbors.append(lookup_prev[n_code]) # list of floats
+                        # lookup_prev 存的是全量 vars_all
+                        found_neighbors.append(lookup_prev[n_code]) 
             
             # Pad or Truncate
-            # 目标: 凑齐 MAX_ADJ_NEIGHBORS 个邻居，每个邻居有 dim_vars_all 个特征
             count = 0
             for n_feat in found_neighbors:
                 if count >= MAX_ADJ_NEIGHBORS: break
-                adj_raw_feats.extend(n_feat) # extend list
+                adj_prev_feats.extend(n_feat) 
                 count += 1
-            
-            # 补 0
             remaining = MAX_ADJ_NEIGHBORS - count
-            adj_raw_feats.extend([0.0] * (remaining * dim_vars_all))
+            adj_prev_feats.extend([0.0] * (remaining * dim_vars_all))
+
+        # 2. Curr Year (Base Feature: Pop Only)
+        adj_curr_feats = []
+        if USE_ADJ_FEATURES:
+            my_code_curr = sub_df.at[i, col_code_curr] if col_code_curr in sub_df.columns else None
+            found_neighbors = []
+            if my_code_curr in adj_curr:
+                nbr_codes = adj_curr[my_code_curr]
+                for n_code in nbr_codes:
+                    if n_code in lookup_curr:
+                        # lookup_curr 存的是全量，我们需要截取 base features
+                        # vars_all: [..., feature_base vars ..., target_base vars ...]
+                        # 假设 feature_base 的变量顺序和 lookup_curr 中的前几列一致
+                        # 我们手动筛选一下
+                        all_vals = lookup_curr[n_code]
+                        # 找到 feature_base 对应的值
+                        # 注意：vars_all = [feature_base, target_base] (大致顺序)
+                        # 我们之前定义 feature_base 是从 vars_all 里筛出来的
+                        # lookup_maps 存的值顺序严格等于 vars_all 列表顺序
+                        # 所以我们需要 indices
+                        
+                        base_vals_only = []
+                        for v_idx, v_name in enumerate(vars_all):
+                            if v_name in feature_base:
+                                base_vals_only.append(all_vals[v_idx])
+                        
+                        found_neighbors.append(base_vals_only)
+            
+            # Pad or Truncate
+            count = 0
+            for n_feat in found_neighbors:
+                if count >= MAX_ADJ_NEIGHBORS: break
+                adj_curr_feats.extend(n_feat) 
+                count += 1
+            remaining = MAX_ADJ_NEIGHBORS - count
+            adj_curr_feats.extend([0.0] * (remaining * dim_feat_base))
+
             
         # --- C. 自身特征 ---
         self_feats = []
@@ -342,8 +380,8 @@ def process_period(wide_df, names_subset, year_prev, year_curr, is_training_data
             if pd.notna(p) and pd.notna(c): self_feats.append(c - p)
             else: self_feats.append(np.nan)
         
-        # 组合: [Self, KNN_Mean, Adj_Raw_Neighbors]
-        full_row = self_feats + knn_feats + adj_raw_feats
+        # 组合: [Self, KNN_Mean, Adj_Prev, Adj_Curr]
+        full_row = self_feats + knn_feats + adj_prev_feats + adj_curr_feats
         
         # --- Target ---
         base_vals = [prev_vals_dict.get(t, np.nan) for t in target_base]
@@ -415,46 +453,46 @@ X_train_scaled = scaler.fit_transform(X_train_imputed)
 X_pred_scaled = scaler.transform(X_pred_imputed) if len(X_pred_raw) > 0 else X_pred_raw
 
 # 确定 Input 维度切分点
-# Self + KNN 特征数量 (非 Adj 部分)
 dim_vars_all = len(vars_all)
 dim_feat_base = len(feature_base)
-# Self features count: All_Prev + Base_Curr + Base_Delta
+
+# Static
 dim_self = dim_vars_all + dim_feat_base * 2 
-# KNN features count: All_Prev_Mean + Base_Curr_Mean
 dim_knn = (dim_vars_all + dim_feat_base) if USE_KNN_FEATURES else 0
-
 static_dim = dim_self + dim_knn
-adj_total_dim = (dim_vars_all * MAX_ADJ_NEIGHBORS) if USE_ADJ_FEATURES else 0
 
-print(f"Feature dims -> Static: {static_dim}, Adj(Flattened): {adj_total_dim}, Total: {X_train_scaled.shape[1]}")
+# Adj Dims
+dim_adj_prev = (dim_vars_all * MAX_ADJ_NEIGHBORS) if USE_ADJ_FEATURES else 0
+dim_adj_curr = (dim_feat_base * MAX_ADJ_NEIGHBORS) if USE_ADJ_FEATURES else 0
 
-# ===================== 6) 可训练的 Attention 模型 =====================
-class AttentionWeightedNet(nn.Module):
-    def __init__(self, static_dim, neighbor_dim, max_neighbors):
-        super(AttentionWeightedNet, self).__init__()
+print(f"Feature dims -> Static: {static_dim}, AdjPrev: {dim_adj_prev}, AdjCurr: {dim_adj_curr}")
+
+# ===================== 6) 双路 Attention 模型 =====================
+class DualAttentionNet(nn.Module):
+    def __init__(self, static_dim, dim_vars_all, dim_feat_base, max_neighbors):
+        super(DualAttentionNet, self).__init__()
         self.static_dim = static_dim
-        self.neighbor_dim = neighbor_dim # 单个邻居的特征维数 (vars_all)
+        self.dim_vars_all = dim_vars_all
+        self.dim_feat_base = dim_feat_base
         self.max_neighbors = max_neighbors
         self.use_adj = (max_neighbors > 0)
         
-        # 1. 邻居特征编码器 (Neighbor Encoder)
         if self.use_adj:
-            self.nbr_encoder = nn.Sequential(
-                nn.Linear(neighbor_dim, 32),
-                nn.ReLU(),
-            )
+            # === Branch 1: Prev Year (Full Features) ===
+            self.encoder_prev = nn.Sequential(nn.Linear(dim_vars_all, 32), nn.ReLU())
+            self.query_prev = nn.Linear(static_dim, 32)
+            self.key_prev = nn.Linear(32, 32)
             
-            # 2. Attention Mechanism
-            # Query 来自 Self (Static), Key 来自 Neighbor
-            self.query_proj = nn.Linear(static_dim, 32)
-            self.key_proj = nn.Linear(32, 32) # encoded nbr -> key
+            # === Branch 2: Curr Year (Base Features) ===
+            self.encoder_curr = nn.Sequential(nn.Linear(dim_feat_base, 32), nn.ReLU())
+            self.query_curr = nn.Linear(static_dim, 32)
+            self.key_curr = nn.Linear(32, 32)
             
-            # 聚合后的维度
-            self.context_dim = 32
+            self.context_dim = 32 + 32
         else:
             self.context_dim = 0
             
-        # 3. Main Prediction Network
+        # Main Net
         self.main_net = nn.Sequential(
             nn.Linear(static_dim + self.context_dim, 128),
             nn.ReLU(),
@@ -464,38 +502,46 @@ class AttentionWeightedNet(nn.Module):
             nn.Linear(64, 4)
         )
         
+    def _apply_attention(self, x_static, neighbors, encoder, query_proj, key_proj, dim_per_nbr):
+        batch_size = x_static.shape[0]
+        # Reshape [Batch, Max_N, Feature_Dim]
+        nbrs_view = neighbors.view(batch_size, self.max_neighbors, dim_per_nbr)
+        
+        # Encode
+        nbr_encoded = encoder(nbrs_view) # [Batch, Max_N, 32]
+        
+        # Attention
+        query = query_proj(x_static).unsqueeze(1) # [Batch, 1, 32]
+        keys = key_proj(nbr_encoded) # [Batch, Max_N, 32]
+        
+        scores = torch.bmm(query, keys.transpose(1, 2)) / (32 ** 0.5)
+        weights = F.softmax(scores, dim=-1) # [Batch, 1, Max_N]
+        
+        context = torch.bmm(weights, nbr_encoded).squeeze(1) # [Batch, 32]
+        return context
+
     def forward(self, x):
-        # x shape: [batch, total_features]
-        # Split input
         x_static = x[:, :self.static_dim]
         
         if self.use_adj:
-            x_adj_flat = x[:, self.static_dim:]
-            batch_size = x.shape[0]
+            # Slice inputs
+            offset_prev = self.static_dim
+            len_prev = self.max_neighbors * self.dim_vars_all
+            x_prev = x[:, offset_prev : offset_prev + len_prev]
             
-            # Reshape: [Batch, Max_Neighbors, Neighbor_Dim]
-            neighbors = x_adj_flat.view(batch_size, self.max_neighbors, self.neighbor_dim)
+            offset_curr = offset_prev + len_prev
+            len_curr = self.max_neighbors * self.dim_feat_base
+            x_curr = x[:, offset_curr : offset_curr + len_curr]
             
-            # Encode neighbors: [Batch, Max_Neighbors, 32]
-            nbr_encoded = self.nbr_encoder(neighbors)
+            # Apply Attention
+            ctx_prev = self._apply_attention(
+                x_static, x_prev, self.encoder_prev, self.query_prev, self.key_prev, self.dim_vars_all
+            )
+            ctx_curr = self._apply_attention(
+                x_static, x_curr, self.encoder_curr, self.query_curr, self.key_curr, self.dim_feat_base
+            )
             
-            # Compute Attention Scores
-            # Query: [Batch, 32] -> [Batch, 1, 32]
-            query = self.query_proj(x_static).unsqueeze(1)
-            
-            # Key: [Batch, Max_Neighbors, 32]
-            keys = self.key_proj(nbr_encoded)
-            
-            # Scores: [Batch, 1, 32] @ [Batch, 32, Max_N] -> [Batch, 1, Max_N]
-            scores = torch.bmm(query, keys.transpose(1, 2))
-            scores = scores / (32 ** 0.5) # Scale
-            weights = F.softmax(scores, dim=-1) # [Batch, 1, Max_N]
-            
-            # Weighted Sum (Context): [Batch, 1, Max_N] @ [Batch, Max_N, 32] -> [Batch, 1, 32]
-            context = torch.bmm(weights, nbr_encoded).squeeze(1)
-            
-            # Concat
-            combined = torch.cat([x_static, context], dim=1)
+            combined = torch.cat([x_static, ctx_prev, ctx_curr], dim=1)
         else:
             combined = x_static
             
@@ -509,10 +555,10 @@ def train_one_model(X, y, seed, epochs=800, lr=0.001):
     X_t = torch.tensor(X, dtype=torch.float32).to(device)
     y_t = torch.tensor(y, dtype=torch.float32).to(device)
     
-    # Init Model
-    model = AttentionWeightedNet(
+    model = DualAttentionNet(
         static_dim=static_dim, 
-        neighbor_dim=dim_vars_all, 
+        dim_vars_all=dim_vars_all,
+        dim_feat_base=dim_feat_base,
         max_neighbors=MAX_ADJ_NEIGHBORS if USE_ADJ_FEATURES else 0
     ).to(device)
     
@@ -605,4 +651,4 @@ if len(X_pred_scaled) > 0:
             completed_df.to_excel(writer, sheet_name="wide_completed", index=False)
         print(f"Saved to {out_pred_xlsx}")
     except: pass
-print("✅ Done. Attention-based Spatial NN.")
+print("✅ Done. Dual-Attention Spatial NN.")
